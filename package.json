@@ -1,0 +1,27 @@
+{
+  "name": "smart-job-auto-applier",
+  "version": "1.0.0",
+  "description": "Automated job application system using Gemini AI and custom SMTP",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "automation",
+    "job-application",
+    "gemini-ai",
+    "background-service"
+  ],
+  "author": "Ankan Saha",
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^0.3.0",
+    "axiodb": "^4.33.127",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.15",
+    "pdf-parse": "^1.1.1"
+  }
+}
