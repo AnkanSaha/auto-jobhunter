@@ -24,3 +24,4 @@ Thumbs.db
 *.swo
 jobs.json
 jobQueue.json
+.profile_cache.json

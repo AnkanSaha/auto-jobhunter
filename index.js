@@ -3,8 +3,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
 import nodemailer from 'nodemailer';
-import pdf from 'pdf-parse';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleAIFileManager } from '@google/generative-ai/server';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -15,24 +15,37 @@ const __dirname = path.dirname(__filename);
 const RESUME_PATH = path.join(__dirname, 'resume.pdf');
 const JOBS_DB_PATH = path.join(__dirname, 'jobs.json');
 const QUEUE_PATH = path.join(__dirname, 'jobQueue.json');
-const SENDER_EMAIL = 'connect@ankan.in';
-const SENDER_NAME = 'Ankan Saha';
 
 // Rate limit: 12 emails per hour
 const MAX_EMAILS_PER_RUN = 12;
-const EMAIL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes between emails (12 per hour)
+const EMAIL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes between emails
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+// Email configuration from environment
+const SENDER_EMAIL = process.env.SENDER_EMAIL || process.env.SMTP_USER;
+const SENDER_NAME = process.env.SENDER_NAME || 'Job Applicant';
+
+// Create email transporter (supports Gmail and other SMTP providers)
+function createTransporter() {
+  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
+  const port = parseInt(process.env.SMTP_PORT || '587');
+  const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+}
+
+const transporter = createTransporter();
 
 // JSON file database functions
 async function loadJobsDb() {
@@ -40,7 +53,6 @@ async function loadJobsDb() {
     const data = await fs.readFile(JOBS_DB_PATH, 'utf-8');
     return JSON.parse(data);
   } catch (error) {
-    // File doesn't exist, return empty structure
     return { jobs: [], sentEmails: [], sentCompanies: [] };
   }
 }
@@ -55,7 +67,6 @@ async function loadQueue() {
     const data = await fs.readFile(QUEUE_PATH, 'utf-8');
     return JSON.parse(data);
   } catch (error) {
-    // File doesn't exist, return empty array
     return [];
   }
 }
@@ -68,7 +79,7 @@ async function addJobsToQueue(jobs) {
   const queue = await loadQueue();
   queue.push(...jobs);
   await saveQueue(queue);
-  console.log(`📥 Added ${jobs.length} jobs to queue (Total in queue: ${queue.length})`);
+  console.log(`📥 Added ${jobs.length} jobs to queue (Total: ${queue.length})`);
 }
 
 async function removeJobFromQueue(jobIndex) {
@@ -105,7 +116,6 @@ async function markJobSent(job) {
     sentAt: new Date().toISOString()
   });
 
-  // Track all emails sent
   if (job.hrEmail) {
     db.sentEmails.push(job.hrEmail.toLowerCase());
   }
@@ -116,7 +126,7 @@ async function markJobSent(job) {
 
   await saveJobsDb(db);
   const emailList = [job.hrEmail, job.decisionMakerEmail].filter(Boolean).join(', ');
-  console.log(`💾 Saved to DB: ${job.company} (${emailList})`);
+  console.log(`💾 Saved: ${job.company} (${emailList})`);
 }
 
 async function markJobFailed(job, errorMessage) {
@@ -128,12 +138,10 @@ async function markJobFailed(job, errorMessage) {
     errorMessage,
     failedAt: new Date().toISOString()
   });
-  // Don't add to sentEmails so we can retry later
-  // But add to sentCompanies to avoid duplicate company contacts
   db.sentCompanies.push(job.company.toLowerCase());
 
   await saveJobsDb(db);
-  console.log(`💾 Saved failed job: ${job.company}`);
+  console.log(`💾 Marked failed: ${job.company}`);
 }
 
 async function getSentCompanies() {
@@ -148,41 +156,33 @@ async function getJobStats() {
   return { total: db.jobs.length, sent, failed };
 }
 
-async function parseResume() {
+// Upload resume to Gemini File API
+async function uploadResume() {
   try {
-    console.log('📄 Parsing resume...');
-    const dataBuffer = await fs.readFile(RESUME_PATH);
-    const data = await pdf(dataBuffer);
-    console.log(`✅ Resume parsed: ${data.text.length} characters extracted`);
-    return data.text;
+    console.log('📄 Uploading resume to Gemini...');
+    const uploadResult = await fileManager.uploadFile(RESUME_PATH, {
+      mimeType: 'application/pdf',
+      displayName: 'Resume',
+    });
+    console.log(`✅ Resume uploaded successfully`);
+    return uploadResult.file;
   } catch (error) {
-    console.error('❌ Failed to parse resume:', error.message);
+    console.error('❌ Failed to upload resume:', error.message);
     throw error;
   }
 }
 
-function extractSkills(resumeText) {
-  const skillPatterns = [
-    /Node\.?js/gi, /TypeScript/gi, /JavaScript/gi, /Python/gi, /Go(lang)?/gi,
-    /Docker/gi, /Kubernetes/gi, /AWS/gi, /GCP/gi, /Azure/gi, /Cloudflare/gi,
-    /PostgreSQL/gi, /MongoDB/gi, /Redis/gi, /MySQL/gi, /Kafka/gi, /RabbitMQ/gi,
-    /GraphQL/gi, /REST/gi, /gRPC/gi, /WebSocket/gi,
-    /React/gi, /Next\.?js/gi, /Vue/gi, /Svelte/gi,
-    /CI\/CD/gi, /Terraform/gi, /Linux/gi, /Nginx/gi,
-    /Microservices/gi, /Distributed Systems/gi, /System Design/gi
-  ];
-
-  const skills = new Set();
-  for (const pattern of skillPatterns) {
-    const matches = resumeText.match(pattern);
-    if (matches) {
-      matches.forEach(m => skills.add(m.toLowerCase()));
-    }
-  }
-  return Array.from(skills);
+function formatTargetArea(type) {
+  const labels = {
+    'indian_mid_startup': '🇮🇳 Indian Mid-Level Startup (Series A-C)',
+    'foreign_startup': '🌍 Foreign/International Startup',
+    'mnc': '🏢 MNC/Large Enterprise',
+    'early_startup': '🚀 Early-Stage Startup (Seed/Pre-Seed)'
+  };
+  return labels[type] || type;
 }
 
-function scoreJob(job, resumeSkills) {
+function scoreJob(job, profile) {
   let score = 0;
 
   // Work type priority: remote > hybrid > onsite
@@ -199,9 +199,17 @@ function scoreJob(job, resumeSkills) {
 
   // Skill match score
   const jobDescription = `${job.role} ${job.snippet} ${job.requirements || ''}`.toLowerCase();
+  const allSkills = [
+    ...(profile.skills?.programmingLanguages || []),
+    ...(profile.skills?.frameworks || []),
+    ...(profile.skills?.databases || []),
+    ...(profile.skills?.tools || []),
+    ...(profile.skills?.other || [])
+  ];
+
   let matchedSkills = 0;
-  for (const skill of resumeSkills) {
-    if (jobDescription.includes(skill)) matchedSkills++;
+  for (const skill of allSkills) {
+    if (jobDescription.includes(skill.toLowerCase())) matchedSkills++;
   }
   score += matchedSkills * 15;
 
@@ -213,177 +221,278 @@ function scoreJob(job, resumeSkills) {
   return score;
 }
 
-async function findJobs(resumeText) {
+// Single Gemini call that extracts profile, analyzes resume, and finds jobs
+async function analyzeAndFindJobs(resumeFile) {
   try {
-    console.log('🔍 Searching for jobs using Gemini with Search Grounding...');
+    console.log('🤖 Calling Gemini API (profile + analysis + jobs)...');
 
-    const resumeSkills = extractSkills(resumeText);
-    console.log(`📋 Extracted skills: ${resumeSkills.join(', ')}`);
-
-    // Get already contacted companies to exclude
     const sentCompanies = await getSentCompanies();
     const excludeSection = sentCompanies.length > 0
       ? `
 
-STRICT EXCLUSION - DO NOT INCLUDE THESE COMPANIES (already contacted, skip them completely):
+STRICT EXCLUSION - DO NOT INCLUDE THESE COMPANIES (already contacted):
 ${sentCompanies.join(', ')}
 
 DO NOT return any job from the above companies. Find NEW companies only.`
       : '';
 
-    const prompt = `Search for Backend Engineer, Systems Engineer, Platform Engineer, or Infrastructure Engineer job openings posted in the last 24-48 hours.
+    const prompt = `You are a resume parser, career advisor, and job search assistant. Analyze the attached resume PDF and perform ALL tasks in ONE response.
 
-CRITICAL: ONLY find jobs matching the ACTUAL tech stack below. DO NOT return jobs for Java, C#, .NET, Ruby, PHP, or any language NOT listed.
-
-REQUIRED TECH STACK (job MUST match at least 2 of these):
-✅ Node.js, TypeScript, JavaScript, Golang
-✅ React.js, Next.js (for Full Stack roles)
-✅ Docker, Kubernetes, Cloudflare Workers
-✅ MongoDB, Redis, PostgreSQL
-✅ Microservices, System Design, CI/CD
-
-❌ EXCLUDE these (DO NOT return):
-- Java / Spring Boot jobs
-- C# / .NET jobs
-- Ruby / Rails jobs
-- PHP / Laravel jobs
-- Python-only jobs (unless also mentions Node.js/TypeScript)
+TASK 1: Extract candidate profile from the resume
+TASK 2: Analyze the resume for ATS compatibility and career targeting
+TASK 3: Search for matching job openings (last 24-48 hours) using Google Search
+TASK 4: Generate personalized cold emails for each job
 
 ${excludeSection}
 
-PRIORITY ORDER for search:
-1. REMOTE positions (fully remote, work from anywhere)
-2. HYBRID positions (partial remote)
-3. ON-SITE positions (only if no remote/hybrid found)
+Return ONLY a valid JSON object with this EXACT structure:
+{
+  "profile": {
+    "name": "Full Name from resume",
+    "email": "email@example.com",
+    "phone": "+1234567890",
+    "location": "City, Country",
+    "linkedIn": "linkedin.com/in/username or null",
+    "github": "github.com/username or null",
+    "portfolio": "portfolio-url.com or null",
+    "summary": "Brief professional summary based on resume (2-3 sentences)",
+    "currentRole": "Current or most recent job title",
+    "yearsOfExperience": 5,
+    "skills": {
+      "programmingLanguages": ["JavaScript", "TypeScript", "Python", "Go"],
+      "frameworks": ["React", "Node.js", "Express", "Next.js"],
+      "databases": ["PostgreSQL", "MongoDB", "Redis"],
+      "tools": ["Docker", "Kubernetes", "AWS", "Git"],
+      "other": ["System Design", "Microservices", "REST APIs"]
+    },
+    "experience": [
+      {
+        "company": "Company Name",
+        "role": "Job Title",
+        "duration": "Jan 2020 - Present",
+        "highlights": ["Achievement 1 with metrics", "Achievement 2 with metrics"]
+      }
+    ],
+    "education": [
+      {
+        "institution": "University Name",
+        "degree": "Degree Name",
+        "year": "2020"
+      }
+    ],
+    "projects": [
+      {
+        "name": "Project Name",
+        "description": "What the project does",
+        "technologies": ["Tech1", "Tech2"],
+        "url": "github.com/user/project or null"
+      }
+    ],
+    "achievements": ["Quantified achievement 1", "Quantified achievement 2"],
+    "certifications": ["Certification 1", "Certification 2"]
+  },
+  "analysis": {
+    "atsScore": 85,
+    "atsScoreBreakdown": {
+      "keywords": 80,
+      "formatting": 90,
+      "experience": 85,
+      "skills": 88
+    },
+    "targetAreas": {
+      "bestFit": "indian_mid_startup",
+      "ranking": [
+        {"type": "indian_mid_startup", "fitScore": 90, "reason": "Strong relevant skills"},
+        {"type": "foreign_startup", "fitScore": 85, "reason": "Good experience level"},
+        {"type": "mnc", "fitScore": 70, "reason": "May need more enterprise experience"},
+        {"type": "early_startup", "fitScore": 75, "reason": "Good for hands-on roles"}
+      ]
+    },
+    "strengths": ["Strength 1", "Strength 2"],
+    "improvements": ["Improvement 1", "Improvement 2"],
+    "keywordsMissing": ["Keyword 1", "Keyword 2"],
+    "recommendedJobTitles": ["Title 1", "Title 2", "Title 3"]
+  },
+  "jobs": [
+    {
+      "company": "Company Name",
+      "role": "Job Title",
+      "snippet": "Brief job description",
+      "requirements": "Key requirements from job posting",
+      "workType": "remote",
+      "companyType": "foreign_startup",
+      "isFamous": true,
+      "fundingStage": "Series B",
+      "location": "Remote",
+      "hrEmail": "hiring@company.com",
+      "decisionMakerEmail": "cto@company.com",
+      "decisionMakerName": "Jane Doe, CTO",
+      "emailSubject": "Compelling subject line",
+      "emailBody": "Professional email body"
+    }
+  ]
+}
 
-TARGET COMPANIES (search for jobs at these types of companies):
-- Famous International/Foreign startups hiring in India: Vercel, Supabase, Cloudflare, Stripe, Figma, Notion, Linear, Railway, Fly.io, PlanetScale, Turso, Neon, Deno, Bun
-- Famous Indian startups: Razorpay, Cred, Zerodha, Postman, Hasura, Groww, Meesho, CRED, PhonePe, Swiggy, Zomato, Flipkart, Atlassian India
-- Well-funded startups (Series A/B/C) with strong engineering culture
-- Companies known for open-source contributions
+PROFILE EXTRACTION RULES:
+- Extract ONLY programming languages/technologies as skills, NOT spoken languages (Bengali, Hindi, English are NOT programming skills)
+- "programmingLanguages" should ONLY contain: JavaScript, TypeScript, Python, Go, Java, C++, Rust, etc.
+- Spoken/human languages should be IGNORED completely
+- Extract ACTUAL data from the resume PDF, don't make up information
+- If a field is not found, use null or empty array
+- Be accurate with names, emails, and contact information
+- Extract ALL quantifiable achievements (numbers, percentages, dollar amounts)
+- For yearsOfExperience, calculate from work history dates
 
-APPLICANT INFO (use this to write personalized emails):
-- Name: Ankan Saha
-- Role: Backend Systems Engineer (Node.js/TypeScript/Golang)
-- Key Achievement: Reduced infrastructure costs by $3,000/month using Cloudflare Workers
-- Open Source: Creator of NexoralDNS (self-hosted DNS server) and xpack (universal Linux package builder)
-- Tech Stack: Node.js, TypeScript, JavaScript, Golang, React, Docker, Kubernetes, MongoDB, Redis
-- Skills: ${resumeSkills.join(', ')}
+JOB SEARCH RULES:
+- Find 10-15 NEW jobs matching the candidate's ACTUAL tech stack from resume
+- ONLY include jobs that match PROGRAMMING technologies found in the resume
+- DO NOT include jobs requiring technologies not in the resume
+- Priority: REMOTE > HYBRID > ON-SITE
+- Target: Well-funded startups, companies with good engineering culture
+- Try to find decision maker emails (CTO, VP Eng, Engineering Manager)
 
-COMPLETE RESUME (use this detailed information to craft accurate, relevant emails):
-${resumeText}
-
-For each job found, extract ALL of these fields AND generate a personalized cold email:
-
-JOB FIELDS:
-1. company - Company name
-2. role - Exact job title
-3. snippet - Brief description (1-2 lines)
-4. requirements - Key technical requirements mentioned
-5. workType - Must be one of: "remote", "hybrid", "onsite"
-6. companyType - One of: "foreign_startup", "indian_startup", "enterprise"
-7. isFamous - true if it's a well-known company, false otherwise
-8. fundingStage - If known (e.g., "Series A", "Series B", "Public")
-9. location - Office location or "Remote"
-10. hrEmail - HR/Careers email (use patterns: jobs@, hiring@, careers@, talent@, hr@, or team@company.com)
-11. decisionMakerEmail - Try to find CTO, VP Engineering, Engineering Manager, or Tech Lead email. If not found, set to null.
-12. decisionMakerName - Name and title of the decision maker if found. If not found, set to null.
-
-EMAIL FIELDS (generate personalized for each job):
-13. emailSubject - Bold, direct subject line (e.g., "Backend Engineer Who Cut Infra Costs by $3K/mo")
-14. emailBody - Punchy cold email (max 150 words) that:
-    - CRITICAL: DO NOT use personalized greetings with names (e.g., "Hi John", "Hello Sarah")
-    - START with generic greeting: "Hi," or "Hello," (no names)
-    - MUST mention: "Reduced infrastructure costs by $3,000/month using Cloudflare Workers"
-    - MUST mention: "Creator of open-source tools like NexoralDNS and xpack"
-    - When mentioning projects, be ACCURATE:
-      * NexoralDNS = self-hosted DNS server (NOT database)
-      * xpack = universal Linux package builder (NOT database)
-      * AxioDB = embedded NoSQL database engine (if mentioning database work)
-    - Connects skills to the specific role/company using COMPLETE RESUME details
-    - Ends with strong call-to-action
-    - Tone: "I solve expensive backend problems"
-    - Sign off as: Ankan Saha
-
-Return ONLY a valid JSON array with this structure:
-[
-  {
-    "company": "Company Name",
-    "role": "Job Title",
-    "snippet": "Brief description",
-    "requirements": "Node.js, Kubernetes, AWS",
-    "workType": "remote",
-    "companyType": "foreign_startup",
-    "isFamous": true,
-    "fundingStage": "Series B",
-    "location": "Remote",
-    "hrEmail": "hiring@company.com",
-    "decisionMakerEmail": "cto@company.com",
-    "decisionMakerName": "John Doe, CTO",
-    "emailSubject": "Backend Engineer Who Cut Infra Costs by $3K/mo - Interested in Role",
-    "emailBody": "Hi,\\n\\nI noticed Company is hiring for Role...\\n\\nBest,\\nAnkan Saha"
-  }
-]
+EMAIL BODY RULES:
+- Use generic greeting "Hi," or "Hello," (NO personalized names)
+- Highlight 2-3 KEY achievements from the resume that match the specific role
+- Be specific about technologies and measurable results from the resume
+- Max 150 words, professional but engaging tone
+- Sign off with the candidate's actual name from the resume
+- DO NOT make up achievements - only use what's in the resume
 
 IMPORTANT:
-- ONLY return jobs that match the Node.js/TypeScript/Golang tech stack
-- Prioritize jobs that match the resume skills
-- Return at least 10-15 NEW jobs (not from excluded list)
-- Try hard to find decision maker emails - this significantly increases response rates
-- Each emailBody must be UNIQUE and tailored to that specific company/role
-- Use proper newlines (\\n) in emailBody for formatting
-- NEVER use personalized names in greetings - always use generic "Hi," or "Hello,"
-- Be ACCURATE about project descriptions using the complete resume data provided above
-- Focus on relevant experience from the full resume based on job requirements
-- DO NOT include Java, C#, .NET, Ruby, PHP, or Python-only jobs`;
+- bestFit must be one of: "indian_mid_startup", "foreign_startup", "mnc", "early_startup"
+- Each email must be unique and tailored to the specific job
+- All data must come from the actual resume PDF provided
+- DO NOT confuse spoken languages with programming languages`;
 
-    const response = await ai.models.generateContent({
+    const model = genAI.getGenerativeModel({
       model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
+      tools: [{ googleSearch: {} }],
     });
 
-    const text = response.text;
+    const result = await model.generateContent([
+      prompt,
+      {
+        fileData: {
+          fileUri: resumeFile.uri,
+          mimeType: resumeFile.mimeType,
+        },
+      },
+    ]);
 
-    console.log('Raw Gemini Response:', text);
+    const text = result.response.text();
+    console.log('✅ Gemini response received');
 
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.log('⚠️ No jobs found in valid JSON format');
-      return [];
+      console.log('⚠️ No valid JSON found in response');
+      return { profile: null, analysis: null, jobs: [] };
     }
 
-    let jobs = JSON.parse(jsonMatch[0]);
+    const response = JSON.parse(jsonMatch[0]);
+
+    // Display profile info
+    if (response.profile) {
+      const profile = response.profile;
+      console.log('\n' + '═'.repeat(60));
+      console.log('👤 PROFILE EXTRACTED');
+      console.log('═'.repeat(60));
+      console.log(`  📛 Name: ${profile.name}`);
+      console.log(`  📧 Email: ${profile.email}`);
+      console.log(`  💼 Current Role: ${profile.currentRole}`);
+      console.log(`  ⏱️  Experience: ${profile.yearsOfExperience} years`);
+      console.log(`  💻 Languages: ${profile.skills?.programmingLanguages?.join(', ') || 'N/A'}`);
+      console.log(`  🛠️  Frameworks: ${profile.skills?.frameworks?.join(', ') || 'N/A'}`);
+      console.log(`  🗄️  Databases: ${profile.skills?.databases?.join(', ') || 'N/A'}`);
+      console.log(`  🔧 Tools: ${profile.skills?.tools?.join(', ') || 'N/A'}`);
+      console.log('═'.repeat(60));
+    }
+
+    // Display ATS analysis
+    if (response.analysis) {
+      const analysis = response.analysis;
+      console.log('\n' + '═'.repeat(60));
+      console.log('📊 RESUME ANALYSIS REPORT');
+      console.log('═'.repeat(60));
+
+      // ATS Score with visual bar
+      const atsScore = analysis.atsScore || 0;
+      const filledBlocks = Math.round(atsScore / 10);
+      const emptyBlocks = 10 - filledBlocks;
+      const scoreBar = '█'.repeat(filledBlocks) + '░'.repeat(emptyBlocks);
+      console.log(`\n🎯 ATS Score: ${scoreBar} ${atsScore}/100`);
+
+      if (analysis.atsScoreBreakdown) {
+        console.log('\n📈 Breakdown:');
+        console.log(`   🔑 Keywords:   ${analysis.atsScoreBreakdown.keywords}/100`);
+        console.log(`   📝 Formatting: ${analysis.atsScoreBreakdown.formatting}/100`);
+        console.log(`   💼 Experience: ${analysis.atsScoreBreakdown.experience}/100`);
+        console.log(`   🛠️  Skills:     ${analysis.atsScoreBreakdown.skills}/100`);
+      }
+
+      console.log(`\n🎯 BEST TARGET: ${formatTargetArea(analysis.targetAreas?.bestFit)}`);
+      if (analysis.targetAreas?.ranking) {
+        console.log('\n🏆 Target Area Rankings:');
+        analysis.targetAreas.ranking.forEach((target, i) => {
+          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '  ';
+          console.log(`   ${medal} ${formatTargetArea(target.type)}: ${target.fitScore}/100`);
+          console.log(`      └─ ${target.reason}`);
+        });
+      }
+
+      console.log('\n💪 STRENGTHS:');
+      (analysis.strengths || []).forEach(s => console.log(`   ✅ ${s}`));
+
+      console.log('\n📈 IMPROVEMENTS NEEDED:');
+      (analysis.improvements || []).forEach(imp => console.log(`   ⚡ ${imp}`));
+
+      console.log('\n🔑 MISSING KEYWORDS:');
+      console.log(`   ${(analysis.keywordsMissing || []).join(', ')}`);
+
+      console.log('\n💼 RECOMMENDED JOB TITLES:');
+      console.log(`   ${(analysis.recommendedJobTitles || []).join(' • ')}`);
+
+      console.log('\n' + '═'.repeat(60));
+    }
+
+    // Process jobs
+    let jobs = response.jobs || [];
+    const profile = response.profile || {};
 
     // Score and sort jobs
     jobs = jobs.map(job => ({
       ...job,
-      score: scoreJob(job, resumeSkills)
+      score: scoreJob(job, profile)
     }));
 
     jobs.sort((a, b) => b.score - a.score);
 
-    console.log(`\n📊 Job Rankings:`);
+    console.log(`\n📋 JOB RANKINGS:`);
+    console.log('─'.repeat(60));
     jobs.forEach((job, i) => {
       const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
       const dmIcon = job.decisionMakerEmail ? '👔' : '  ';
-      console.log(`  ${i + 1}. [Score: ${job.score}] ${workIcon} ${dmIcon} ${job.role} at ${job.company} (${job.workType})`);
+      const rank = i < 3 ? ['🥇', '🥈', '🥉'][i] : `${i + 1}.`;
+      console.log(`   ${rank} ${workIcon} ${dmIcon} [${job.score}pts] ${job.role} @ ${job.company}`);
     });
-    console.log(`  Legend: 👔 = Decision maker email found`);
+    console.log('─'.repeat(60));
+    console.log(`   Legend: 🌍 Remote | 🏠 Hybrid | 🏢 Onsite | 👔 Decision Maker`);
 
-    console.log(`\n✅ Found ${jobs.length} jobs, sorted by match score`);
-    return jobs;
+    console.log(`\n✨ Found ${jobs.length} jobs, sorted by match score`);
+
+    return {
+      profile: response.profile,
+      analysis: response.analysis,
+      jobs: jobs
+    };
 
   } catch (error) {
-    console.error('❌ Failed to find jobs:', error.message);
-    return [];
+    console.error('❌ Failed to analyze resume and find jobs:', error.message);
+    return { profile: null, analysis: null, jobs: [] };
   }
 }
 
-async function sendEmail(recipients, subject, body) {
-  // recipients can be a string or array of emails
+async function sendEmail(recipients, subject, body, senderName) {
   const toList = Array.isArray(recipients) ? recipients.filter(Boolean) : [recipients];
 
   if (toList.length === 0) {
@@ -392,7 +501,7 @@ async function sendEmail(recipients, subject, body) {
 
   try {
     const mailOptions = {
-      from: `"${SENDER_NAME}" <${SENDER_EMAIL}>`,
+      from: `"${senderName}" <${SENDER_EMAIL}>`,
       to: toList.join(', '),
       subject,
       text: body,
@@ -406,10 +515,10 @@ async function sendEmail(recipients, subject, body) {
     };
 
     await transporter.sendMail(mailOptions);
-    console.log(`✅ Email sent to: ${toList.join(', ')} (with resume attached)`);
+    console.log(`   ✉️  Email sent to: ${toList.join(', ')}`);
 
   } catch (error) {
-    console.error(`❌ Failed to send email to ${toList.join(', ')}:`, error.message);
+    console.error(`   ❌ Failed to send email to ${toList.join(', ')}:`, error.message);
     throw error;
   }
 }
@@ -418,31 +527,35 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function processJobQueue(clearAll = false) {
+function getLastRunTime() {
+  return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+}
+
+async function processJobQueue(senderName, clearAll = false) {
   const queueSize = await getQueueSize();
-  
+
   if (queueSize === 0) {
     console.log('📭 Queue is empty. No pending jobs to process.');
     return 0;
   }
 
   console.log(`\n📬 Found ${queueSize} jobs in queue. Processing...`);
-  
+
   const queue = await loadQueue();
   const jobsToProcess = clearAll ? queue : queue.slice(0, MAX_EMAILS_PER_RUN);
-  
-  // Calculate estimated completion time
+
   const totalDelayMs = (jobsToProcess.length - 1) * EMAIL_INTERVAL_MS;
   const estimatedEndTime = new Date(Date.now() + totalDelayMs);
   const estimatedMinutes = Math.round(totalDelayMs / 60000);
 
   if (clearAll) {
-    console.log(`🔥 CLEARING ENTIRE QUEUE: Processing all ${jobsToProcess.length} jobs...`);
+    console.log(`🔥 Processing ALL ${jobsToProcess.length} jobs from queue...`);
   } else {
-    console.log(`📧 Processing ${jobsToProcess.length} jobs from queue (max ${MAX_EMAILS_PER_RUN}/hour)...`);
+    console.log(`📧 Processing ${jobsToProcess.length} jobs (max ${MAX_EMAILS_PER_RUN}/hour)...`);
   }
-  console.log(`⏱️ Estimated time: ~${estimatedMinutes} minutes`);
-  console.log(`🏁 Expected completion: ${estimatedEndTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n`);
+  console.log(`⏱️  Estimated time: ~${estimatedMinutes} minutes`);
+  console.log(`🏁 Expected completion: ${estimatedEndTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
+  console.log('─'.repeat(60));
 
   let sentCount = 0;
   let failedCount = 0;
@@ -450,22 +563,19 @@ async function processJobQueue(clearAll = false) {
   for (let i = 0; i < jobsToProcess.length; i++) {
     const job = jobsToProcess[i];
     const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
-    const typeLabel = job.companyType === 'foreign_startup' ? '🌐 Foreign' : job.companyType === 'indian_startup' ? '🇮🇳 Indian' : '🏛️ Enterprise';
 
-    // Build recipient list
     const recipients = [job.hrEmail];
     if (job.decisionMakerEmail) {
       recipients.push(job.decisionMakerEmail);
     }
 
-    console.log(`[${i + 1}/${jobsToProcess.length}] ${workIcon} ${typeLabel} | Score: ${job.score} | ${job.role} at ${job.company}`);
-    console.log(`  📧 HR: ${job.hrEmail}`);
+    console.log(`\n📨 [${i + 1}/${jobsToProcess.length}] ${workIcon} ${job.role} @ ${job.company}`);
+    console.log(`   📊 Score: ${job.score} | 📧 HR: ${job.hrEmail}`);
     if (job.decisionMakerEmail) {
-      console.log(`  👔 Decision Maker: ${job.decisionMakerName || 'Unknown'} <${job.decisionMakerEmail}>`);
+      console.log(`   👔 Decision Maker: ${job.decisionMakerName || 'Unknown'} <${job.decisionMakerEmail}>`);
     }
 
     try {
-      // Use pre-generated email content from Gemini
       const subject = job.emailSubject || `Application for ${job.role} at ${job.company}`;
       const body = (job.emailBody || '').replace(/\\n/g, '\n');
 
@@ -473,70 +583,72 @@ async function processJobQueue(clearAll = false) {
         throw new Error('No email body generated');
       }
 
-      await sendEmail(recipients, subject, body);
-
-      // Mark as sent in jobs.json
+      await sendEmail(recipients, subject, body, senderName);
       await markJobSent(job);
-      
-      // Remove from queue (success)
-      await removeJobFromQueue(0); // Always remove first item as we process in order
-      console.log(`✅ Removed from queue`);
-      
+      await removeJobFromQueue(0);
+      console.log(`   ✅ Sent successfully!`);
+
       sentCount++;
     } catch (error) {
-      console.error(`⚠️ Failed ${job.company}:`, error.message);
-      
-      // Mark as failed in jobs.json but KEEP in queue
+      console.error(`   ❌ Failed: ${error.message}`);
       await markJobFailed(job, error.message);
-      console.log(`⚠️ Kept in queue for retry`);
-      
+      console.log(`   🔄 Kept in queue for retry`);
+
       failedCount++;
     }
 
-    // Wait 5 minutes between emails regardless of success/failure (12 per hour)
     if (i < jobsToProcess.length - 1) {
-      console.log(`⏳ Waiting 5 minutes before next email...`);
+      console.log(`   ⏳ Waiting 5 minutes before next email...`);
       await delay(EMAIL_INTERVAL_MS);
     }
   }
 
-  console.log(`\n📊 Queue Processing Stats: Sent ${sentCount} | Failed ${failedCount}`);
-  
+  console.log('\n' + '─'.repeat(60));
+  console.log(`📊 Queue Stats: ✅ Sent: ${sentCount} | ❌ Failed: ${failedCount}`);
+
   return sentCount;
 }
 
-async function runJobApplicationCycle(isScheduled = false) {
-  console.log('\n🚀 Starting job application cycle...');
+async function runJobApplicationCycle() {
+  console.log('\n' + '🚀'.repeat(20));
+  console.log('🚀 STARTING JOB APPLICATION CYCLE');
+  console.log('🚀'.repeat(20));
   console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
   console.log(`📧 Rate limit: ${MAX_EMAILS_PER_RUN} emails/hour\n`);
 
   try {
-    // STEP 1: Check and process existing queue first
+    // Upload resume to Gemini
+    const resumeFile = await uploadResume();
+
+    // Single Gemini call for everything
+    const { profile, jobs } = await analyzeAndFindJobs(resumeFile);
+
+    if (!profile) {
+      console.log('❌ Failed to extract profile. Skipping this cycle.');
+      return;
+    }
+
+    const senderName = profile.name || SENDER_NAME;
+    console.log(`👤 Candidate: ${senderName}`);
+
+    // Check if there are existing jobs in queue
     const queueSize = await getQueueSize();
-    
     if (queueSize > 0) {
       console.log(`\n🔄 Processing existing queue (${queueSize} jobs pending)...`);
-      const processedCount = await processJobQueue(false); // Regular processing (max 12)
-      
-      // If we processed the max limit, don't generate new jobs this cycle
+      const processedCount = await processJobQueue(senderName, false);
+
       if (processedCount >= MAX_EMAILS_PER_RUN) {
         console.log(`\n✅ Processed ${processedCount} jobs from queue. Max limit reached.`);
-        console.log(`📝 Will generate new jobs in next cycle (if queue is empty).\n`);
+        console.log(`📝 Will process new jobs in next cycle.\n`);
         return;
       }
     }
-
-    // STEP 2: Generate new jobs only if queue is empty or we have capacity
-    console.log(`\n🔍 Generating new job listings...`);
-    const resumeText = await parseResume();
-    const jobs = await findJobs(resumeText);
 
     if (jobs.length === 0) {
       console.log('⚠️ No new jobs found. Skipping this cycle.');
       return;
     }
 
-    // Filter out already contacted emails and companies
     console.log(`\n🔍 Filtering already contacted...`);
     const newJobs = [];
     for (const job of jobs) {
@@ -544,11 +656,11 @@ async function runJobApplicationCycle(isScheduled = false) {
       const companySent = await isCompanySent(job.company);
 
       if (hrEmailSent) {
-        console.log(`  ⏭️ Email already sent: ${job.hrEmail}`);
+        console.log(`   ⏭️  Skip: Email already sent to ${job.hrEmail}`);
         continue;
       }
       if (companySent) {
-        console.log(`  ⏭️ Company already contacted: ${job.company}`);
+        console.log(`   ⏭️  Skip: Already contacted ${job.company}`);
         continue;
       }
       newJobs.push(job);
@@ -559,39 +671,56 @@ async function runJobApplicationCycle(isScheduled = false) {
       return;
     }
 
-    // Add all new jobs to queue
     await addJobsToQueue(newJobs);
-    
-    // Process jobs from queue (up to max limit)
-    console.log(`\n📨 Starting to process newly added jobs...`);
-    await processJobQueue(false); // Regular processing (max 12)
 
-    // Show final stats
+    console.log(`\n📨 Processing newly added jobs...`);
+    await processJobQueue(senderName, false);
+
     const stats = await getJobStats();
     const remainingInQueue = await getQueueSize();
-    
-    console.log('\n📊 Final Stats:');
-    console.log(`  All time: Total ${stats.total} | Sent ${stats.sent} | Failed ${stats.failed}`);
-    console.log(`  Queue: ${remainingInQueue} jobs pending`);
 
-    console.log('\n✨ Job application cycle completed!\n');
+    console.log('\n' + '═'.repeat(60));
+    console.log('📊 CYCLE STATS');
+    console.log('═'.repeat(60));
+    console.log(`   📈 All time: Total ${stats.total} | ✅ Sent ${stats.sent} | ❌ Failed ${stats.failed}`);
+    console.log(`   📬 Queue: ${remainingInQueue} jobs pending`);
+    console.log('═'.repeat(60));
+
+    console.log('\n✨ Job application cycle completed!');
+    console.log(`🕐 Last Run: ${getLastRunTime()}\n`);
 
   } catch (error) {
-    console.error('❌ Fatal error in job application cycle:', error.message);
+    console.error('💥 Fatal error in job application cycle:', error.message);
+    console.log(`🕐 Last Run (Failed): ${getLastRunTime()}\n`);
   }
 }
 
 async function initialStartupRun() {
-  console.log('\n🎬 INITIAL STARTUP RUN');
-  console.log('=' .repeat(60));
-  
+  console.log('\n' + '🎬'.repeat(20));
+  console.log('🎬 INITIAL STARTUP RUN');
+  console.log('🎬'.repeat(20));
+
   try {
-    // STEP 1: Clear existing queue completely
+    // Upload resume to Gemini
+    const resumeFile = await uploadResume();
+
+    // Single Gemini call for everything
+    console.log('\n🔍 Analyzing resume and searching for jobs...');
+    const { profile, jobs } = await analyzeAndFindJobs(resumeFile);
+
+    if (!profile) {
+      console.log('❌ Failed to extract profile. Cannot proceed.');
+      return null;
+    }
+
+    const senderName = profile.name || SENDER_NAME;
+
+    // Process existing queue first
     const initialQueueSize = await getQueueSize();
     if (initialQueueSize > 0) {
-      console.log(`\n🧹 STEP 1: Clearing existing queue (${initialQueueSize} jobs)...`);
-      await processJobQueue(true); // Clear all jobs in queue
-      
+      console.log(`\n📋 STEP 1: Clearing existing queue (${initialQueueSize} jobs)...`);
+      await processJobQueue(senderName, true);
+
       const remainingAfterClear = await getQueueSize();
       if (remainingAfterClear > 0) {
         console.log(`⚠️ Warning: ${remainingAfterClear} jobs failed to send (will retry later)`);
@@ -599,46 +728,38 @@ async function initialStartupRun() {
         console.log(`✅ Queue completely cleared!`);
       }
     } else {
-      console.log(`\n✅ STEP 1: Queue is already empty.`);
+      console.log(`\n📋 STEP 1: Queue is already empty. ✅`);
     }
 
-    // STEP 2: Generate and process new jobs
-    console.log(`\n🔍 STEP 2: Generating new jobs for today...`);
-    const resumeText = await parseResume();
-    const jobs = await findJobs(resumeText);
-
     if (jobs.length === 0) {
-      console.log('⚠️ No new jobs found.');
+      console.log('\n⚠️ No new jobs found.');
     } else {
-      // Filter out already contacted
-      console.log(`\n🔍 Filtering already contacted...`);
+      console.log(`\n🔍 STEP 2: Filtering already contacted...`);
       const newJobs = [];
       for (const job of jobs) {
         const hrEmailSent = job.hrEmail ? await isEmailSent(job.hrEmail) : false;
         const companySent = await isCompanySent(job.company);
 
         if (hrEmailSent) {
-          console.log(`  ⏭️ Email already sent: ${job.hrEmail}`);
+          console.log(`   ⏭️  Skip: Email already sent to ${job.hrEmail}`);
           continue;
         }
         if (companySent) {
-          console.log(`  ⏭️ Company already contacted: ${job.company}`);
+          console.log(`   ⏭️  Skip: Already contacted ${job.company}`);
           continue;
         }
         newJobs.push(job);
       }
 
       if (newJobs.length > 0) {
-        // Add to queue
         await addJobsToQueue(newJobs);
-        
-        // STEP 3: Clear the newly added queue
+
         console.log(`\n📨 STEP 3: Processing all newly added jobs...`);
-        await processJobQueue(true); // Clear all jobs
-        
+        await processJobQueue(senderName, true);
+
         const finalQueueSize = await getQueueSize();
         if (finalQueueSize > 0) {
-          console.log(`\n⚠️ ${finalQueueSize} jobs remain in queue (failed to send, will retry on next scheduled run)`);
+          console.log(`\n⚠️ ${finalQueueSize} jobs remain in queue (will retry on next scheduled run)`);
         } else {
           console.log(`\n✅ All jobs processed successfully!`);
         }
@@ -647,33 +768,51 @@ async function initialStartupRun() {
       }
     }
 
-    // Show final stats
     const stats = await getJobStats();
     const remainingInQueue = await getQueueSize();
-    
-    console.log('\n' + '=' .repeat(60));
-    console.log('📊 STARTUP RUN COMPLETE');
-    console.log('=' .repeat(60));
-    console.log(`  All time: Total ${stats.total} | Sent ${stats.sent} | Failed ${stats.failed}`);
-    console.log(`  Queue: ${remainingInQueue} jobs pending`);
-    console.log('=' .repeat(60) + '\n');
+
+    console.log('\n' + '═'.repeat(60));
+    console.log('🎉 STARTUP RUN COMPLETE');
+    console.log('═'.repeat(60));
+    console.log(`   👤 Candidate: ${senderName}`);
+    console.log(`   📈 All time: Total ${stats.total} | ✅ Sent ${stats.sent} | ❌ Failed ${stats.failed}`);
+    console.log(`   📬 Queue: ${remainingInQueue} jobs pending`);
+    console.log(`   🕐 Last Run: ${getLastRunTime()}`);
+    console.log('═'.repeat(60) + '\n');
+
+    return profile;
 
   } catch (error) {
-    console.error('❌ Fatal error in initial startup run:', error.message);
+    console.error('💥 Fatal error in initial startup run:', error.message);
+    console.log(`🕐 Last Run (Failed): ${getLastRunTime()}\n`);
+    return null;
   }
 }
 
 async function verifySetup() {
-  console.log('🔧 Verifying setup...\n');
+  console.log('\n' + '🔧'.repeat(20));
+  console.log('🔧 VERIFYING SETUP');
+  console.log('🔧'.repeat(20) + '\n');
 
   // Check environment variables
-  const requiredEnvVars = ['GEMINI_API_KEY', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS'];
+  const requiredEnvVars = ['GEMINI_API_KEY', 'SMTP_USER', 'SMTP_PASS'];
   const missing = requiredEnvVars.filter(key => !process.env[key]);
 
   if (missing.length > 0) {
     console.error(`❌ Missing environment variables: ${missing.join(', ')}`);
+    console.log('\n📋 Required environment variables:');
+    console.log('   🔑 GEMINI_API_KEY - Google Gemini API key');
+    console.log('   📧 SMTP_USER      - Email address (e.g., your-email@gmail.com)');
+    console.log('   🔐 SMTP_PASS      - Email password or app password');
+    console.log('\n📋 Optional environment variables:');
+    console.log('   🌐 SMTP_HOST      - SMTP server (default: smtp.gmail.com)');
+    console.log('   🔌 SMTP_PORT      - SMTP port (default: 587)');
+    console.log('   🔒 SMTP_SECURE    - Use SSL (default: false, true for port 465)');
+    console.log('   📤 SENDER_EMAIL   - From email (default: SMTP_USER)');
+    console.log('   👤 SENDER_NAME    - From name (default: extracted from resume)');
     process.exit(1);
   }
+  console.log('✅ Environment variables configured');
 
   // Check resume file
   try {
@@ -681,6 +820,7 @@ async function verifySetup() {
     console.log('✅ Resume file found');
   } catch {
     console.error(`❌ Resume file not found at: ${RESUME_PATH}`);
+    console.log('📝 Please place your resume as "resume.pdf" in the project root directory.');
     process.exit(1);
   }
 
@@ -690,6 +830,10 @@ async function verifySetup() {
     console.log('✅ SMTP connection verified');
   } catch (error) {
     console.error('❌ SMTP connection failed:', error.message);
+    console.log('\n📧 For Gmail, make sure to:');
+    console.log('   1️⃣  Enable 2-Factor Authentication');
+    console.log('   2️⃣  Create an App Password at https://myaccount.google.com/apppasswords');
+    console.log('   3️⃣  Use the App Password as SMTP_PASS');
     process.exit(1);
   }
 
@@ -703,7 +847,7 @@ async function verifySetup() {
     console.log('✅ Jobs database created');
   }
 
-  // Check/create jobQueue.json
+  // Check queue
   const queueSize = await getQueueSize();
   if (queueSize > 0) {
     console.log(`✅ Job queue found (${queueSize} pending jobs)`);
@@ -711,28 +855,50 @@ async function verifySetup() {
     console.log('✅ Job queue initialized (empty)');
   }
 
-  console.log('✅ All checks passed!\n');
+  console.log('\n🎉 All checks passed!\n');
 }
 
 async function main() {
+  console.log('\n');
+  console.log('╔════════════════════════════════════════════════════════════╗');
+  console.log('║  🤖 AI JOB APPLICATION BOT                                 ║');
+  console.log('║  Automated job search & application system                 ║');
+  console.log('╚════════════════════════════════════════════════════════════╝');
+
   await verifySetup();
 
-  // Run initial startup sequence (clear queue + generate + clear queue)
-  console.log('🎯 Running initial startup sequence...\n');
+  // Run initial startup sequence (single Gemini call)
+  console.log('🚀 Running initial startup sequence...\n');
   await initialStartupRun();
 
-  // Schedule daily at 11:00 AM IST
-  cron.schedule('0 11 * * *', async () => {
-    console.log('\n⏰ Scheduled run triggered at 11:00 AM IST');
-    await runJobApplicationCycle(true);
-  }, {
-    scheduled: true,
-    timezone: 'Asia/Kolkata'
+  // Schedule runs at 11 AM, 2 PM, 5 PM, and 9 PM IST
+  const schedules = [
+    { cron: '0 11 * * *', label: '11:00 AM IST' },
+    { cron: '0 14 * * *', label: '2:00 PM IST' },
+    { cron: '0 17 * * *', label: '5:00 PM IST' },
+    { cron: '0 21 * * *', label: '9:00 PM IST' },
+  ];
+
+  schedules.forEach(({ cron: cronExpr, label }) => {
+    cron.schedule(cronExpr, async () => {
+      console.log(`\n⏰ Scheduled run triggered at ${label}`);
+      await runJobApplicationCycle();
+    }, {
+      scheduled: true,
+      timezone: 'Asia/Kolkata'
+    });
   });
 
-  console.log('\n✅ Initial run completed!');
-  console.log('⏰ Scheduler active: Job application will run daily at 11:00 AM IST');
-  console.log('🔄 Service is running in the background...\n');
+  console.log('\n╔════════════════════════════════════════════════════════════╗');
+  console.log('║  ✅ INITIAL RUN COMPLETED                                  ║');
+  console.log('╠════════════════════════════════════════════════════════════╣');
+  console.log('║  ⏰ Scheduler active! Job applications will run at:        ║');
+  schedules.forEach(({ label }) => {
+    console.log(`║     📅 ${label.padEnd(48)}║`);
+  });
+  console.log('║                                                            ║');
+  console.log('║  🔄 Service is running in the background...               ║');
+  console.log('╚════════════════════════════════════════════════════════════╝\n');
 }
 
 main().catch(console.error);
