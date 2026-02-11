@@ -347,9 +347,25 @@ JOB SEARCH RULES:
 - Find 10-15 NEW jobs matching the candidate's ACTUAL tech stack from resume
 - ONLY include jobs that match PROGRAMMING technologies found in the resume
 - DO NOT include jobs requiring technologies not in the resume
-- Priority: REMOTE > HYBRID > ON-SITE
-- Target: Well-funded startups, companies with good engineering culture
-- Try to find decision maker emails (CTO, VP Eng, Engineering Manager)
+
+COMPANY PRIORITY (search in this order):
+1. FAMOUS/TOP-TIER companies FIRST (Google, Meta, Amazon, Microsoft, Apple, Netflix, Stripe, Vercel, Supabase, Cloudflare, Figma, Notion, Linear, etc.)
+2. WELL-FUNDED UNICORNS (Razorpay, Zerodha, CRED, Meesho, PhonePe, Swiggy, Zomato, Ola, Flipkart, etc.)
+3. SERIES B/C STARTUPS with strong engineering culture
+4. SERIES A STARTUPS only if above not available
+5. Early-stage startups as last resort
+
+WORK TYPE PRIORITY:
+1. REMOTE positions (fully remote, work from anywhere) - HIGHEST PRIORITY
+2. HYBRID positions (partial remote)
+3. ON-SITE positions (only if no remote/hybrid found)
+
+SEARCH STRATEGY:
+- First search for: "[tech stack from resume] jobs at [famous company names] remote 2026"
+- Then search for: "[job title] remote jobs hiring now"
+- Look for recent job postings (last 24-48 hours)
+- Check company career pages, LinkedIn, Wellfound, levels.fyi
+- Try to find decision maker emails (CTO, VP Eng, Engineering Manager, Hiring Manager)
 
 EMAIL BODY RULES:
 - Use generic greeting "Hi," or "Hello," (NO personalized names)
@@ -701,7 +717,25 @@ async function initialStartupRun() {
   console.log('🎬'.repeat(20));
 
   try {
-    // Upload resume to Gemini
+    let senderName = SENDER_NAME; // Initialize with default/env SENDER_NAME
+
+    // Process existing queue FIRST
+    const initialQueueSize = await getQueueSize();
+    if (initialQueueSize > 0) {
+      console.log(`\n📋 Processing existing queue (${initialQueueSize} jobs)...`);
+      await processJobQueue(senderName, true);
+
+      const remainingAfterClear = await getQueueSize();
+      if (remainingAfterClear > 0) {
+        console.log(`⚠️ Warning: ${remainingAfterClear} jobs failed to send (will retry later)`);
+      } else {
+        console.log(`✅ Queue completely cleared!`);
+      }
+    } else {
+      console.log(`\n📋 Queue is already empty. ✅`);
+    }
+
+    // Now, upload resume and call Gemini for new jobs
     const resumeFile = await uploadResume();
 
     // Single Gemini call for everything
@@ -713,23 +747,8 @@ async function initialStartupRun() {
       return null;
     }
 
-    const senderName = profile.name || SENDER_NAME;
-
-    // Process existing queue first
-    const initialQueueSize = await getQueueSize();
-    if (initialQueueSize > 0) {
-      console.log(`\n📋 STEP 1: Clearing existing queue (${initialQueueSize} jobs)...`);
-      await processJobQueue(senderName, true);
-
-      const remainingAfterClear = await getQueueSize();
-      if (remainingAfterClear > 0) {
-        console.log(`⚠️ Warning: ${remainingAfterClear} jobs failed to send (will retry later)`);
-      } else {
-        console.log(`✅ Queue completely cleared!`);
-      }
-    } else {
-      console.log(`\n📋 STEP 1: Queue is already empty. ✅`);
-    }
+    // Update senderName if profile is successfully extracted
+    senderName = profile.name || SENDER_NAME;
 
     if (jobs.length === 0) {
       console.log('\n⚠️ No new jobs found.');
