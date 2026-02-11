@@ -347,6 +347,7 @@ JOB SEARCH RULES:
 - Find 10-15 NEW jobs matching the candidate's ACTUAL tech stack from resume
 - ONLY include jobs that match PROGRAMMING technologies found in the resume
 - DO NOT include jobs requiring technologies not in the resume
+- When providing hrEmail or decisionMakerEmail, prioritize official company domains and publicly listed contact information. Avoid generic email providers (like Gmail, Outlook, Yahoo) or personal email addresses unless they are explicitly stated as official hiring contacts. Focus on reliable and verifiable sources to minimize "email address not found" errors.
 
 COMPANY PRIORITY (search in this order):
 1. FAMOUS/TOP-TIER companies FIRST (Google, Meta, Amazon, Microsoft, Apple, Netflix, Stripe, Vercel, Supabase, Cloudflare, Figma, Notion, Linear, etc.)
