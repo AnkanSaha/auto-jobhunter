@@ -15,10 +15,11 @@ const __dirname = path.dirname(__filename);
 const RESUME_PATH = path.join(__dirname, 'resume.pdf');
 const JOBS_DB_PATH = path.join(__dirname, 'jobs.json');
 const QUEUE_PATH = path.join(__dirname, 'jobQueue.json');
+const MANUAL_PATH = path.join(__dirname, 'manual.json');
 
 // Rate limit: 12 emails per hour
 const MAX_EMAILS_PER_RUN = 12;
-const EMAIL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes between emails
+const EMAIL_INTERVAL_MS = 1 * 60 * 1000; // 5 minutes between emails
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -97,6 +98,44 @@ async function getQueueSize() {
   return queue.length;
 }
 
+// Manual job queue functions (for jobs without emails)
+async function loadManualQueue() {
+  try {
+    const data = await fs.readFile(MANUAL_PATH, 'utf-8');
+    return JSON.parse(data);
+  } catch (error) {
+    return [];
+  }
+}
+
+async function saveManualQueue(queue) {
+  await fs.writeFile(MANUAL_PATH, JSON.stringify(queue, null, 2));
+}
+
+async function addJobToManual(job) {
+  const manualQueue = await loadManualQueue();
+  manualQueue.push({
+    company: job.company,
+    role: job.role,
+    snippet: job.snippet,
+    requirements: job.requirements,
+    location: job.location,
+    workType: job.workType,
+    companyType: job.companyType,
+    isFamous: job.isFamous,
+    fundingStage: job.fundingStage,
+    emailSubject: job.emailSubject,
+    emailBody: job.emailBody,
+    decisionMakerName: job.decisionMakerName || null,
+    decisionMakerTitle: job.decisionMakerTitle || null,
+    score: job.score,
+    addedAt: new Date().toISOString(),
+    reason: 'Decision maker email not found - requires manual search'
+  });
+  await saveManualQueue(manualQueue);
+  console.log(`📝 Added to manual.json: ${job.company} - ${job.role}`);
+}
+
 async function isEmailSent(email) {
   const db = await loadJobsDb();
   return db.sentEmails.includes(email.toLowerCase());
@@ -116,17 +155,13 @@ async function markJobSent(job) {
     sentAt: new Date().toISOString()
   });
 
-  if (job.hrEmail) {
-    db.sentEmails.push(job.hrEmail.toLowerCase());
-  }
   if (job.decisionMakerEmail) {
     db.sentEmails.push(job.decisionMakerEmail.toLowerCase());
   }
   db.sentCompanies.push(job.company.toLowerCase());
 
   await saveJobsDb(db);
-  const emailList = [job.hrEmail, job.decisionMakerEmail].filter(Boolean).join(', ');
-  console.log(`💾 Saved: ${job.company} (${emailList})`);
+  console.log(`💾 Saved: ${job.company} (${job.decisionMakerEmail})`);
 }
 
 async function markJobFailed(job, errorMessage) {
@@ -324,11 +359,11 @@ Return ONLY a valid JSON object with this EXACT structure:
       "isFamous": true,
       "fundingStage": "Series B",
       "location": "Remote",
-      "hrEmail": "hiring@company.com",
       "decisionMakerEmail": "cto@company.com",
-      "decisionMakerName": "Jane Doe, CTO",
+      "decisionMakerName": "Jane Doe",
+      "decisionMakerTitle": "CTO",
       "emailSubject": "Compelling subject line",
-      "emailBody": "Professional email body"
+      "emailBody": "Professional email body with strong call to action for referral"
     }
   ]
 }
@@ -347,7 +382,17 @@ JOB SEARCH RULES:
 - Find 10-15 NEW jobs matching the candidate's ACTUAL tech stack from resume
 - ONLY include jobs that match PROGRAMMING technologies found in the resume
 - DO NOT include jobs requiring technologies not in the resume
-- When providing hrEmail or decisionMakerEmail, prioritize official company domains and publicly listed contact information. Avoid generic email providers (like Gmail, Outlook, Yahoo) or personal email addresses unless they are explicitly stated as official hiring contacts. Focus on reliable and verifiable sources to minimize "email address not found" errors.
+
+CRITICAL EMAIL SEARCH RULES - READ CAREFULLY:
+- DO NOT find HR emails, hiring emails, or recruitment emails
+- ONLY find DECISION MAKER emails: CTO, VP Engineering, Engineering Manager, Tech Lead, Team Lead, Head of Engineering, Founder, CEO
+- These decision makers can REFER the candidate to their company
+- DO NOT GUESS EMAIL ADDRESSES - Guessed emails will FAIL and bounce
+- You MUST do a DEEP SEARCH to find verified, publicly listed emails only
+- Search company websites, LinkedIn profiles, GitHub, Twitter, company blogs, press releases
+- If you find a VERIFIED decision maker email through deep search, include it in decisionMakerEmail field
+- If you CANNOT find a verified decision maker email after deep search, set decisionMakerEmail to null but STILL include the job
+- Jobs without verified emails will be automatically saved to manual.json for the candidate to manually find emails later
 
 COMPANY PRIORITY (search in this order):
 1. FAMOUS/TOP-TIER companies FIRST (Google, Meta, Amazon, Microsoft, Apple, Netflix, Stripe, Vercel, Supabase, Cloudflare, Figma, Notion, Linear, etc.)
@@ -361,29 +406,46 @@ WORK TYPE PRIORITY:
 2. HYBRID positions (partial remote)
 3. ON-SITE positions (only if no remote/hybrid found)
 
-SEARCH STRATEGY:
+SEARCH STRATEGY FOR JOBS:
 - First search for: "[tech stack from resume] jobs at [famous company names] remote 2026"
 - Then search for: "[job title] remote jobs hiring now"
 - Look for recent job postings (last 24-48 hours)
 - Check company career pages, LinkedIn, Wellfound, levels.fyi
-- Try to find decision maker emails (CTO, VP Eng, Engineering Manager, Hiring Manager)
+
+SEARCH STRATEGY FOR DECISION MAKER EMAILS (CRITICAL):
+- For each company, you MUST attempt to find a decision maker's email through deep search
+- Search: "[Company name] CTO email", "[Company name] VP Engineering email", "[Company name] Engineering Manager LinkedIn"
+- Check: Company website team/about pages, LinkedIn profiles, GitHub profiles, Twitter/X, company blogs, press releases
+- Look for: CTO, VP Engineering, Engineering Manager, Tech Lead, Team Lead, Head of Engineering, Founder (if technical)
+- DO NOT guess email patterns (like firstname@company.com) - this will cause failures
+- ONLY use publicly listed, verifiable email addresses
+- If you cannot find a verified decision maker email after thorough search, STILL INCLUDE THE JOB but set decisionMakerEmail to null
+- Jobs without emails will be saved to manual.json for the candidate to find emails manually later
 
 EMAIL BODY RULES:
-- Use generic greeting "Hi," or "Hello," (NO personalized names)
+- Address the decision maker by their name and title (e.g., "Hi Jane," or "Hello John,")
+- Briefly introduce the candidate and mention the specific role they're interested in
 - Highlight 2-3 KEY achievements from the resume that match the specific role
 - Be specific about technologies and measurable results from the resume
-- Max 150 words, professional but engaging tone
+- MUST include a STRONG CALL TO ACTION asking for a referral to the company
+- Example CTAs: "Would you be willing to refer me to your team?" or "Could you connect me with your hiring team?" or "I'd greatly appreciate if you could refer me for this position"
+- Max 150 words, professional but engaging and personable tone
 - Sign off with the candidate's actual name from the resume
 - DO NOT make up achievements - only use what's in the resume
+- The goal is to get the decision maker to REFER the candidate, not just acknowledge the email
 
 IMPORTANT:
 - bestFit must be one of: "indian_mid_startup", "foreign_startup", "mnc", "early_startup"
 - Each email must be unique and tailored to the specific job
 - All data must come from the actual resume PDF provided
-- DO NOT confuse spoken languages with programming languages`;
+- DO NOT confuse spoken languages with programming languages
+- Return ALL matching jobs - even if you couldn't find a decision maker email (set decisionMakerEmail to null in that case)
+- Jobs without verified emails will be saved to manual.json automatically
+- For jobs WITH emails: The email recipient (decision maker) should be asked to REFER the candidate to their company
+- The email is NOT an application - it's a request for a referral from someone who can vouch for the candidate`;
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-3-pro-preview',
       tools: [{ googleSearch: {} }],
     });
 
@@ -488,14 +550,19 @@ IMPORTANT:
     console.log('─'.repeat(60));
     jobs.forEach((job, i) => {
       const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
-      const dmIcon = job.decisionMakerEmail ? '👔' : '  ';
+      const dmIcon = job.decisionMakerEmail ? '👔' : '❌';
       const rank = i < 3 ? ['🥇', '🥈', '🥉'][i] : `${i + 1}.`;
       console.log(`   ${rank} ${workIcon} ${dmIcon} [${job.score}pts] ${job.role} @ ${job.company}`);
+      if (job.decisionMakerEmail) {
+        console.log(`      -> ${job.decisionMakerName || 'Unknown'} (${job.decisionMakerTitle || 'Decision Maker'})`);
+      }
     });
     console.log('─'.repeat(60));
-    console.log(`   Legend: 🌍 Remote | 🏠 Hybrid | 🏢 Onsite | 👔 Decision Maker`);
+    console.log(`   Legend: 🌍 Remote | 🏠 Hybrid | 🏢 Onsite | 👔 Decision Maker Found | ❌ No Email`);
 
-    console.log(`\n✨ Found ${jobs.length} jobs, sorted by match score`);
+    const jobsWithEmail = jobs.filter(j => j.decisionMakerEmail).length;
+    const jobsWithoutEmail = jobs.length - jobsWithEmail;
+    console.log(`\n✨ Found ${jobs.length} jobs (${jobsWithEmail} with decision maker email, ${jobsWithoutEmail} will go to manual.json)`);
 
     return {
       profile: response.profile,
@@ -581,16 +648,19 @@ async function processJobQueue(senderName, clearAll = false) {
     const job = jobsToProcess[i];
     const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
 
-    const recipients = [job.hrEmail];
-    if (job.decisionMakerEmail) {
-      recipients.push(job.decisionMakerEmail);
+    if (!job.decisionMakerEmail) {
+      console.log(`\n⚠️ [${i + 1}/${jobsToProcess.length}] Skipping ${job.company} - No decision maker email found`);
+      await addJobToManual(job);
+      await removeJobFromQueue(0);
+      continue;
     }
 
+    const recipients = [job.decisionMakerEmail];
+
     console.log(`\n📨 [${i + 1}/${jobsToProcess.length}] ${workIcon} ${job.role} @ ${job.company}`);
-    console.log(`   📊 Score: ${job.score} | 📧 HR: ${job.hrEmail}`);
-    if (job.decisionMakerEmail) {
-      console.log(`   👔 Decision Maker: ${job.decisionMakerName || 'Unknown'} <${job.decisionMakerEmail}>`);
-    }
+    console.log(`   📊 Score: ${job.score}`);
+    console.log(`   👔 Decision Maker: ${job.decisionMakerName || 'Unknown'} (${job.decisionMakerTitle || 'N/A'}) <${job.decisionMakerEmail}>`);
+
 
     try {
       const subject = job.emailSubject || `Application for ${job.role} at ${job.company}`;
@@ -615,7 +685,7 @@ async function processJobQueue(senderName, clearAll = false) {
     }
 
     if (i < jobsToProcess.length - 1) {
-      console.log(`   ⏳ Waiting 5 minutes before next email...`);
+      console.log(`   ⏳ Waiting 1 minutes before next email...`);
       await delay(EMAIL_INTERVAL_MS);
     }
   }
@@ -666,14 +736,23 @@ async function runJobApplicationCycle() {
       return;
     }
 
-    console.log(`\n🔍 Filtering already contacted...`);
+    console.log(`\n🔍 Filtering jobs...`);
     const newJobs = [];
+    const jobsWithoutEmail = [];
+
     for (const job of jobs) {
-      const hrEmailSent = job.hrEmail ? await isEmailSent(job.hrEmail) : false;
+      // Skip if no decision maker email found
+      if (!job.decisionMakerEmail) {
+        console.log(`   📝 No decision maker email: ${job.company} - ${job.role} (will add to manual.json)`);
+        jobsWithoutEmail.push(job);
+        continue;
+      }
+
+      const emailSent = await isEmailSent(job.decisionMakerEmail);
       const companySent = await isCompanySent(job.company);
 
-      if (hrEmailSent) {
-        console.log(`   ⏭️  Skip: Email already sent to ${job.hrEmail}`);
+      if (emailSent) {
+        console.log(`   ⏭️  Skip: Email already sent to ${job.decisionMakerEmail}`);
         continue;
       }
       if (companySent) {
@@ -681,6 +760,14 @@ async function runJobApplicationCycle() {
         continue;
       }
       newJobs.push(job);
+    }
+
+    // Add jobs without emails to manual.json
+    if (jobsWithoutEmail.length > 0) {
+      console.log(`\n📝 Adding ${jobsWithoutEmail.length} jobs to manual.json (no decision maker email found)`);
+      for (const job of jobsWithoutEmail) {
+        await addJobToManual(job);
+      }
     }
 
     if (newJobs.length === 0) {
@@ -754,14 +841,23 @@ async function initialStartupRun() {
     if (jobs.length === 0) {
       console.log('\n⚠️ No new jobs found.');
     } else {
-      console.log(`\n🔍 STEP 2: Filtering already contacted...`);
+      console.log(`\n🔍 STEP 2: Filtering jobs...`);
       const newJobs = [];
+      const jobsWithoutEmail = [];
+
       for (const job of jobs) {
-        const hrEmailSent = job.hrEmail ? await isEmailSent(job.hrEmail) : false;
+        // Skip if no decision maker email found
+        if (!job.decisionMakerEmail) {
+          console.log(`   📝 No decision maker email: ${job.company} - ${job.role} (will add to manual.json)`);
+          jobsWithoutEmail.push(job);
+          continue;
+        }
+
+        const emailSent = await isEmailSent(job.decisionMakerEmail);
         const companySent = await isCompanySent(job.company);
 
-        if (hrEmailSent) {
-          console.log(`   ⏭️  Skip: Email already sent to ${job.hrEmail}`);
+        if (emailSent) {
+          console.log(`   ⏭️  Skip: Email already sent to ${job.decisionMakerEmail}`);
           continue;
         }
         if (companySent) {
@@ -769,6 +865,14 @@ async function initialStartupRun() {
           continue;
         }
         newJobs.push(job);
+      }
+
+      // Add jobs without emails to manual.json
+      if (jobsWithoutEmail.length > 0) {
+        console.log(`\n📝 Adding ${jobsWithoutEmail.length} jobs to manual.json (no decision maker email found)`);
+        for (const job of jobsWithoutEmail) {
+          await addJobToManual(job);
+        }
       }
 
       if (newJobs.length > 0) {
