@@ -15,7 +15,6 @@ const __dirname = path.dirname(__filename);
 const RESUME_PATH = path.join(__dirname, 'resume.pdf');
 const JOBS_DB_PATH = path.join(__dirname, 'jobs.json');
 const QUEUE_PATH = path.join(__dirname, 'jobQueue.json');
-const MANUAL_PATH = path.join(__dirname, 'manual.json');
 
 // Rate limit: 12 emails per hour
 const MAX_EMAILS_PER_RUN = 12;
@@ -98,44 +97,6 @@ async function getQueueSize() {
   return queue.length;
 }
 
-// Manual job queue functions (for jobs without emails)
-async function loadManualQueue() {
-  try {
-    const data = await fs.readFile(MANUAL_PATH, 'utf-8');
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-async function saveManualQueue(queue) {
-  await fs.writeFile(MANUAL_PATH, JSON.stringify(queue, null, 2));
-}
-
-async function addJobToManual(job) {
-  const manualQueue = await loadManualQueue();
-  manualQueue.push({
-    company: job.company,
-    role: job.role,
-    snippet: job.snippet,
-    requirements: job.requirements,
-    location: job.location,
-    workType: job.workType,
-    companyType: job.companyType,
-    isFamous: job.isFamous,
-    fundingStage: job.fundingStage,
-    emailSubject: job.emailSubject,
-    emailBody: job.emailBody,
-    decisionMakerName: job.decisionMakerName || null,
-    decisionMakerTitle: job.decisionMakerTitle || null,
-    score: job.score,
-    addedAt: new Date().toISOString(),
-    reason: 'Decision maker email not found - requires manual search'
-  });
-  await saveManualQueue(manualQueue);
-  console.log(`📝 Added to manual.json: ${job.company} - ${job.role}`);
-}
-
 async function isEmailSent(email) {
   const db = await loadJobsDb();
   return db.sentEmails.includes(email.toLowerCase());
@@ -146,22 +107,25 @@ async function isCompanySent(company) {
   return db.sentCompanies.includes(company.toLowerCase());
 }
 
-async function markJobSent(job) {
+async function markJobSent(job, sentRecipients) {
   const db = await loadJobsDb();
 
   db.jobs.push({
     ...job,
     status: 'sent',
-    sentAt: new Date().toISOString()
+    sentAt: new Date().toISOString(),
+    sentRecipients: sentRecipients.map(r => ({ name: r.name, title: r.title, email: r.email }))
   });
 
-  if (job.decisionMakerEmail) {
-    db.sentEmails.push(job.decisionMakerEmail.toLowerCase());
+  for (const recipient of sentRecipients) {
+    if (recipient.email) {
+      db.sentEmails.push(recipient.email.toLowerCase());
+    }
   }
   db.sentCompanies.push(job.company.toLowerCase());
 
   await saveJobsDb(db);
-  console.log(`💾 Saved: ${job.company} (${job.decisionMakerEmail})`);
+  console.log(`💾 Saved: ${job.company} (${sentRecipients.length} recipients)`);
 }
 
 async function markJobFailed(job, errorMessage) {
@@ -206,6 +170,9 @@ async function uploadResume() {
     throw error;
   }
 }
+
+// Upload resume to Gemini
+const resumeFile = await uploadResume();
 
 function formatTargetArea(type) {
   const labels = {
@@ -256,6 +223,17 @@ function scoreJob(job, profile) {
   return score;
 }
 
+function isWorkTypeAllowed(job) {
+  const location = (job.location || '').toLowerCase();
+  const workType = (job.workType || '').toLowerCase();
+  const isKolkata = location.includes('kolkata') || location.includes('calcutta');
+
+  if (isKolkata) {
+    return true; // onsite, hybrid, remote all OK for Kolkata
+  }
+  return workType === 'remote' || workType === 'hybrid'; // outside Kolkata: no onsite
+}
+
 // Single Gemini call that extracts profile, analyzes resume, and finds jobs
 async function analyzeAndFindJobs(resumeFile) {
   try {
@@ -276,7 +254,7 @@ DO NOT return any job from the above companies. Find NEW companies only.`
 TASK 1: Extract candidate profile from the resume
 TASK 2: Analyze the resume for ATS compatibility and career targeting
 TASK 3: Search for matching job openings (last 24-48 hours) using Google Search
-TASK 4: Generate personalized cold emails for each job
+TASK 4: Find multiple contacts per company and generate a unique personalized cold email for each contact
 
 ${excludeSection}
 
@@ -327,7 +305,7 @@ Return ONLY a valid JSON object with this EXACT structure:
     "certifications": ["Certification 1", "Certification 2"]
   },
   "analysis": {
-    "atsScore": 85,
+    "atsScore": 50,
     "atsScoreBreakdown": {
       "keywords": 80,
       "formatting": 90,
@@ -359,11 +337,24 @@ Return ONLY a valid JSON object with this EXACT structure:
       "isFamous": true,
       "fundingStage": "Series B",
       "location": "Remote",
-      "decisionMakerEmail": "cto@company.com",
-      "decisionMakerName": "Jane Doe",
-      "decisionMakerTitle": "CTO",
-      "emailSubject": "Compelling subject line",
-      "emailBody": "Professional email body with strong call to action for referral"
+      "recipients": [
+        {
+          "email": "cto@company.com",
+          "name": "Jane Doe",
+          "title": "CTO",
+          "emailGuessed": false,
+          "emailSubject": "Unique personalized subject for Jane as CTO",
+          "emailBody": "Unique personalized body addressing Jane's perspective as CTO"
+        },
+        {
+          "email": "john.smith@company.com",
+          "name": "John Smith",
+          "title": "Senior Engineer",
+          "emailGuessed": true,
+          "emailSubject": "Unique personalized subject for John as Senior Engineer",
+          "emailBody": "Unique personalized body addressing John's perspective as Senior Engineer"
+        }
+      ]
     }
   ]
 }
@@ -383,16 +374,25 @@ JOB SEARCH RULES:
 - ONLY include jobs that match PROGRAMMING technologies found in the resume
 - DO NOT include jobs requiring technologies not in the resume
 
-CRITICAL EMAIL SEARCH RULES - READ CAREFULLY:
-- DO NOT find HR emails, hiring emails, or recruitment emails
-- ONLY find DECISION MAKER emails: CTO, VP Engineering, Engineering Manager, Tech Lead, Team Lead, Head of Engineering, Founder, CEO
-- These decision makers can REFER the candidate to their company
-- DO NOT GUESS EMAIL ADDRESSES - Guessed emails will FAIL and bounce
-- You MUST do a DEEP SEARCH to find verified, publicly listed emails only
+CRITICAL EMAIL SEARCH RULES — TWO-STEP APPROACH:
+- DO NOT find HR emails, hiring emails, or generic recruitment emails
+- Find ALL of these people at each company if possible: CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Team Lead, Senior Engineer, Staff Engineer, Principal Engineer
+- Each person found = one entry in the recipients array with their OWN unique personalized email
+- Aim for 2-4 contacts per company (verified or inferred)
+
+STEP 1 — VERIFY (always try first for each person):
 - Search company websites, LinkedIn profiles, GitHub, Twitter, company blogs, press releases
-- If you find a VERIFIED decision maker email through deep search, include it in decisionMakerEmail field
-- If you CANNOT find a verified decision maker email after deep search, set decisionMakerEmail to null but STILL include the job
-- Jobs without verified emails will be automatically saved to manual.json for the candidate to manually find emails later
+- If a publicly listed, confirmed email is found → set emailGuessed: false
+
+STEP 2 — INFER (fallback if no verified email found for that person):
+- First determine the company's email domain from ANY known source (another employee's visible email, website contact page, press release, etc.)
+- For CEO / CTO / Co-Founder / VP-level (senior leadership): use firstname@companydomain.com
+  Example: Deepinder Goyal at Zomato → deepinder@zomato.com
+- For Engineering Manager / Tech Lead / Senior / Staff / Principal Engineer: use firstname.lastname@companydomain.com
+  Example: Ankan Saha at Hoichoi → ankan.saha@hoichoi.tv
+- Set emailGuessed: true for ALL inferred emails
+- If you cannot determine the company's email domain at all, skip that person entirely
+- If you cannot find the person's real name, skip that person entirely (do not guess names)
 
 COMPANY PRIORITY (search in this order):
 1. FAMOUS/TOP-TIER companies FIRST (Google, Meta, Amazon, Microsoft, Apple, Netflix, Stripe, Vercel, Supabase, Cloudflare, Figma, Notion, Linear, etc.)
@@ -404,7 +404,9 @@ COMPANY PRIORITY (search in this order):
 WORK TYPE PRIORITY:
 1. REMOTE positions (fully remote, work from anywhere) - HIGHEST PRIORITY
 2. HYBRID positions (partial remote)
-3. ON-SITE positions (only if no remote/hybrid found)
+3. ON-SITE positions ONLY for jobs located in Kolkata, India
+- For jobs OUTSIDE Kolkata: include REMOTE and HYBRID only, skip ON-SITE
+- For jobs IN Kolkata: REMOTE, HYBRID, and ON-SITE are all acceptable
 
 SEARCH STRATEGY FOR JOBS:
 - First search for: "[tech stack from resume] jobs at [famous company names] remote 2026"
@@ -412,40 +414,65 @@ SEARCH STRATEGY FOR JOBS:
 - Look for recent job postings (last 24-48 hours)
 - Check company career pages, LinkedIn, Wellfound, levels.fyi
 
-SEARCH STRATEGY FOR DECISION MAKER EMAILS (CRITICAL):
-- For each company, you MUST attempt to find a decision maker's email through deep search
-- Search: "[Company name] CTO email", "[Company name] VP Engineering email", "[Company name] Engineering Manager LinkedIn"
+SEARCH STRATEGY FOR CONTACTS (CRITICAL):
+- For each company, search for MULTIPLE contacts across all seniority levels
+- Search: "[Company name] CTO email", "[Company name] VP Engineering email", "[Company name] senior engineer LinkedIn", "[Company name] tech lead email"
 - Check: Company website team/about pages, LinkedIn profiles, GitHub profiles, Twitter/X, company blogs, press releases
-- Look for: CTO, VP Engineering, Engineering Manager, Tech Lead, Team Lead, Head of Engineering, Founder (if technical)
-- DO NOT guess email patterns (like firstname@company.com) - this will cause failures
-- ONLY use publicly listed, verifiable email addresses
-- If you cannot find a verified decision maker email after thorough search, STILL INCLUDE THE JOB but set decisionMakerEmail to null
-- Jobs without emails will be saved to manual.json for the candidate to find emails manually later
+- Target roles (in priority order): CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Senior Engineer, Staff Engineer, Principal Engineer
+- Aim for 2-4 contacts per company (mix of verified + inferred is fine)
+- For each person: try verified email first (emailGuessed: false), then infer from domain pattern (emailGuessed: true)
+- To find the domain: look for any employee email visible anywhere, or check the company website's contact/about page
+- If you find 0 verified AND cannot determine the domain → set recipients to [] but STILL INCLUDE THE JOB
+- Jobs with empty recipients array will be automatically skipped
 
-EMAIL BODY RULES:
-- Address the decision maker by their name and title (e.g., "Hi Jane," or "Hello John,")
-- Briefly introduce the candidate and mention the specific role they're interested in
-- Highlight 2-3 KEY achievements from the resume that match the specific role
-- Be specific about technologies and measurable results from the resume
-- MUST include a STRONG CALL TO ACTION asking for a referral to the company
-- Example CTAs: "Would you be willing to refer me to your team?" or "Could you connect me with your hiring team?" or "I'd greatly appreciate if you could refer me for this position"
-- Max 150 words, professional but engaging and personable tone
+EMAIL SUBJECT RULES (make it impossible NOT to open):
+- The subject must be a shocking, provocative, witty punchline — NOT a boring "Application for X" line
+- It should feel like breaking news, a confession, a dare, or something deeply personal to the recipient
+- Tailor the subject to the recipient's title and company — make it feel like it was written ONLY for them
+- Examples of the tone you MUST match (do not copy these exactly, generate fresh ones each time):
+  * "I broke prod at 3 companies. Want me to break yours next?"
+  * "Your engineers are leaving. I know why."
+  * "I reverse-engineered your stack. We need to talk."
+  * "Honestly, I should not be emailing you. But here we are."
+  * "Your CTO said this was a bad idea. I'm doing it anyway."
+  * "I found a bug in your hiring process. It's missing me."
+  * "This is either the best or worst email you'll get today."
+  * "I ghosted 3 offers to wait for the right team. Are you it?"
+  * "Warning: reading this email may cause an urgent hiring decision."
+- Never use: "Application for", "Job opportunity", "Referral request", "Reaching out about"
+- Max 10 words. Punchy. Ruthless. Unmissable.
+
+EMAIL BODY RULES (generate SEPARATELY and UNIQUELY for EACH recipient):
+- Each recipient gets a FULLY UNIQUE email — never duplicate subject or body across recipients at the same company
+- FIRST LINE: Acknowledge the wild subject with a brief, charming apology that makes them smile
+  Example openers: "I know — that subject line was a lot. Forgive me. But you opened it, so we're already off to a great start."
+  Or: "Yes, I know. The subject was dramatic. I owe you an apology and also a really good pitch — here's both."
+  Or: "Okay, I'm sorry about the subject. Sort of. You opened it though, so let's make this worth your time."
+- After the apology, pivot cleanly into the actual pitch — make it feel natural, not forced
+- Address each person by name and tailor the angle to their specific title:
+  * CEO/Founder: business impact, growth, execution mindset
+  * CTO/VP Engineering: technical depth, architecture, engineering culture
+  * Engineering Manager/Tech Lead: team collaboration, shipping velocity, mentorship
+  * Senior/Staff/Principal Engineer: specific technologies, code quality, technical details
+- Highlight 2-3 KEY achievements from the resume that resonate with THIS specific person's perspective
+- MUST include a STRONG CALL TO ACTION asking for a referral
+- Max 160 words total (including apology opener)
 - Sign off with the candidate's actual name from the resume
 - DO NOT make up achievements - only use what's in the resume
-- The goal is to get the decision maker to REFER the candidate, not just acknowledge the email
+- The tone should be: confident, self-aware, slightly audacious — someone they WANT to work with
 
 IMPORTANT:
 - bestFit must be one of: "indian_mid_startup", "foreign_startup", "mnc", "early_startup"
-- Each email must be unique and tailored to the specific job
+- Every email subject and body must be UNIQUE per recipient — same company but different people = completely different emails
 - All data must come from the actual resume PDF provided
 - DO NOT confuse spoken languages with programming languages
-- Return ALL matching jobs - even if you couldn't find a decision maker email (set decisionMakerEmail to null in that case)
-- Jobs without verified emails will be saved to manual.json automatically
-- For jobs WITH emails: The email recipient (decision maker) should be asked to REFER the candidate to their company
-- The email is NOT an application - it's a request for a referral from someone who can vouch for the candidate`;
+- Return ALL matching jobs - even if you couldn't find contacts (set recipients to [] in that case)
+- Jobs with empty recipients array will be automatically skipped
+- Each email is a request for REFERRAL, not a job application
+- The goal is to have each contact vouch for or refer the candidate to their team`;
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3-pro-preview',
+      model: '	gemini-3-flash-preview',
       tools: [{ googleSearch: {} }],
     });
 
@@ -550,19 +577,22 @@ IMPORTANT:
     console.log('─'.repeat(60));
     jobs.forEach((job, i) => {
       const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
-      const dmIcon = job.decisionMakerEmail ? '👔' : '❌';
+      const recipients = job.recipients || [];
+      const contactIcon = recipients.length > 0 ? '👔' : '❌';
       const rank = i < 3 ? ['🥇', '🥈', '🥉'][i] : `${i + 1}.`;
-      console.log(`   ${rank} ${workIcon} ${dmIcon} [${job.score}pts] ${job.role} @ ${job.company}`);
-      if (job.decisionMakerEmail) {
-        console.log(`      -> ${job.decisionMakerName || 'Unknown'} (${job.decisionMakerTitle || 'Decision Maker'})`);
-      }
+      console.log(`   ${rank} ${workIcon} ${contactIcon} [${job.score}pts] ${job.role} @ ${job.company} (${recipients.length} contacts)`);
+      recipients.forEach(r => {
+        const tag = r.emailGuessed ? '🔮 inferred' : '✅ verified';
+        console.log(`      -> ${r.name || 'Unknown'} (${r.title || 'Contact'}) <${r.email}> [${tag}]`);
+      });
     });
     console.log('─'.repeat(60));
-    console.log(`   Legend: 🌍 Remote | 🏠 Hybrid | 🏢 Onsite | 👔 Decision Maker Found | ❌ No Email`);
+    console.log(`   Legend: 🌍 Remote | 🏠 Hybrid | 🏢 Onsite | 👔 Contacts Found | ❌ No Contacts`);
 
-    const jobsWithEmail = jobs.filter(j => j.decisionMakerEmail).length;
-    const jobsWithoutEmail = jobs.length - jobsWithEmail;
-    console.log(`\n✨ Found ${jobs.length} jobs (${jobsWithEmail} with decision maker email, ${jobsWithoutEmail} will go to manual.json)`);
+    const jobsWithContacts = jobs.filter(j => j.recipients?.length > 0).length;
+    const totalContacts = jobs.reduce((sum, j) => sum + (j.recipients?.length || 0), 0);
+    const jobsWithoutContacts = jobs.length - jobsWithContacts;
+    console.log(`\n✨ Found ${jobs.length} jobs, ${totalContacts} total contacts (${jobsWithoutContacts} jobs with no contacts will be skipped)`);
 
     return {
       profile: response.profile,
@@ -623,70 +653,96 @@ async function processJobQueue(senderName, clearAll = false) {
     return 0;
   }
 
-  console.log(`\n📬 Found ${queueSize} jobs in queue. Processing...`);
+  console.log(`\n📬 Found ${queueSize} companies in queue. Processing...`);
 
   const queue = await loadQueue();
   const jobsToProcess = clearAll ? queue : queue.slice(0, MAX_EMAILS_PER_RUN);
 
-  const totalDelayMs = (jobsToProcess.length - 1) * EMAIL_INTERVAL_MS;
-  const estimatedEndTime = new Date(Date.now() + totalDelayMs);
+  const totalEmails = jobsToProcess.reduce((sum, j) => sum + (j.recipients?.length || 0), 0);
+  const totalDelayMs = Math.max(0, totalEmails - 1) * EMAIL_INTERVAL_MS;
   const estimatedMinutes = Math.round(totalDelayMs / 60000);
 
   if (clearAll) {
-    console.log(`🔥 Processing ALL ${jobsToProcess.length} jobs from queue...`);
+    console.log(`🔥 Processing ALL ${jobsToProcess.length} companies (${totalEmails} emails total)...`);
   } else {
-    console.log(`📧 Processing ${jobsToProcess.length} jobs (max ${MAX_EMAILS_PER_RUN}/hour)...`);
+    console.log(`📧 Processing ${jobsToProcess.length} companies (${totalEmails} emails, max ${MAX_EMAILS_PER_RUN}/run)...`);
   }
   console.log(`⏱️  Estimated time: ~${estimatedMinutes} minutes`);
-  console.log(`🏁 Expected completion: ${estimatedEndTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
   console.log('─'.repeat(60));
 
   let sentCount = 0;
   let failedCount = 0;
+  let emailsSentThisRun = 0;
 
   for (let i = 0; i < jobsToProcess.length; i++) {
     const job = jobsToProcess[i];
     const workIcon = job.workType === 'remote' ? '🌍' : job.workType === 'hybrid' ? '🏠' : '🏢';
+    const recipients = job.recipients || [];
 
-    if (!job.decisionMakerEmail) {
-      console.log(`\n⚠️ [${i + 1}/${jobsToProcess.length}] Skipping ${job.company} - No decision maker email found`);
-      await addJobToManual(job);
+    if (recipients.length === 0) {
+      console.log(`\n⚠️ [${i + 1}/${jobsToProcess.length}] Skipping ${job.company} - No contacts in queue entry`);
       await removeJobFromQueue(0);
       continue;
     }
 
-    const recipients = [job.decisionMakerEmail];
-
-    console.log(`\n📨 [${i + 1}/${jobsToProcess.length}] ${workIcon} ${job.role} @ ${job.company}`);
+    console.log(`\n🏢 [${i + 1}/${jobsToProcess.length}] ${workIcon} ${job.role} @ ${job.company} — ${recipients.length} contact(s)`);
     console.log(`   📊 Score: ${job.score}`);
-    console.log(`   👔 Decision Maker: ${job.decisionMakerName || 'Unknown'} (${job.decisionMakerTitle || 'N/A'}) <${job.decisionMakerEmail}>`);
 
+    const sentRecipients = [];
 
-    try {
-      const subject = job.emailSubject || `Application for ${job.role} at ${job.company}`;
-      const body = (job.emailBody || '').replace(/\\n/g, '\n');
+    for (let ri = 0; ri < recipients.length; ri++) {
+      const recipient = recipients[ri];
 
-      if (!body) {
-        throw new Error('No email body generated');
+      if (!recipient.email) {
+        console.log(`   ⚠️  [${ri + 1}/${recipients.length}] Skipping ${recipient.name || 'unknown'} - No email`);
+        continue;
       }
 
-      await sendEmail(recipients, subject, body, senderName);
-      await markJobSent(job);
-      await removeJobFromQueue(0);
-      console.log(`   ✅ Sent successfully!`);
+      const emailIcon = recipient.emailGuessed ? '🔮' : '✅';
+      console.log(`\n   📨 [${ri + 1}/${recipients.length}] ${emailIcon} ${recipient.name || 'Unknown'} (${recipient.title || 'Contact'}) <${recipient.email}>${recipient.emailGuessed ? ' [inferred]' : ' [verified]'}`);
 
-      sentCount++;
-    } catch (error) {
-      console.error(`   ❌ Failed: ${error.message}`);
-      await markJobFailed(job, error.message);
-      console.log(`   🔄 Kept in queue for retry`);
+      try {
+        const subject = recipient.emailSubject || `Application for ${job.role} at ${job.company}`;
+        const body = (recipient.emailBody || '').replace(/\\n/g, '\n');
 
-      failedCount++;
+        if (!body) throw new Error('No email body generated');
+
+        await sendEmail([recipient.email], subject, body, senderName);
+        sentRecipients.push(recipient);
+        emailsSentThisRun++;
+        sentCount++;
+        console.log(`      ✅ Sent!`);
+
+      } catch (error) {
+        console.error(`      ❌ Failed: ${error.message}`);
+        failedCount++;
+      }
+
+      // Delay between recipients within the same company
+      if (ri < recipients.length - 1) {
+        console.log(`      ⏳ Waiting before next contact at ${job.company}...`);
+        await delay(EMAIL_INTERVAL_MS);
+      }
     }
 
+    // Mark company done regardless of partial failures
+    if (sentRecipients.length > 0) {
+      await markJobSent(job, sentRecipients);
+    } else {
+      await markJobFailed(job, 'All recipient sends failed');
+    }
+    await removeJobFromQueue(0);
+
+    // Delay between companies
     if (i < jobsToProcess.length - 1) {
-      console.log(`   ⏳ Waiting 1 minutes before next email...`);
+      console.log(`\n   ⏳ Moving to next company...`);
       await delay(EMAIL_INTERVAL_MS);
+    }
+
+    // Rate limit check (only when not clearAll)
+    if (!clearAll && emailsSentThisRun >= MAX_EMAILS_PER_RUN) {
+      console.log(`\n⚠️ Rate limit reached (${emailsSentThisRun} emails). Stopping for this run.`);
+      break;
     }
   }
 
@@ -704,9 +760,6 @@ async function runJobApplicationCycle() {
   console.log(`📧 Rate limit: ${MAX_EMAILS_PER_RUN} emails/hour\n`);
 
   try {
-    // Upload resume to Gemini
-    const resumeFile = await uploadResume();
-
     // Single Gemini call for everything
     const { profile, jobs } = await analyzeAndFindJobs(resumeFile);
 
@@ -738,36 +791,39 @@ async function runJobApplicationCycle() {
 
     console.log(`\n🔍 Filtering jobs...`);
     const newJobs = [];
-    const jobsWithoutEmail = [];
 
     for (const job of jobs) {
-      // Skip if no decision maker email found
-      if (!job.decisionMakerEmail) {
-        console.log(`   📝 No decision maker email: ${job.company} - ${job.role} (will add to manual.json)`);
-        jobsWithoutEmail.push(job);
+      if (!job.recipients || job.recipients.length === 0) {
+        console.log(`   ⏭️  Skip: No contacts found for ${job.company} - ${job.role}`);
         continue;
       }
 
-      const emailSent = await isEmailSent(job.decisionMakerEmail);
-      const companySent = await isCompanySent(job.company);
-
-      if (emailSent) {
-        console.log(`   ⏭️  Skip: Email already sent to ${job.decisionMakerEmail}`);
+      if (!isWorkTypeAllowed(job)) {
+        console.log(`   ⏭️  Skip: On-site outside Kolkata - ${job.company} (${job.location})`);
         continue;
       }
-      if (companySent) {
+
+      if (await isCompanySent(job.company)) {
         console.log(`   ⏭️  Skip: Already contacted ${job.company}`);
         continue;
       }
-      newJobs.push(job);
-    }
 
-    // Add jobs without emails to manual.json
-    if (jobsWithoutEmail.length > 0) {
-      console.log(`\n📝 Adding ${jobsWithoutEmail.length} jobs to manual.json (no decision maker email found)`);
-      for (const job of jobsWithoutEmail) {
-        await addJobToManual(job);
+      // Filter out individual recipients already emailed
+      const freshRecipients = [];
+      for (const r of job.recipients) {
+        if (await isEmailSent(r.email)) {
+          console.log(`   ⏭️  Skip recipient: ${r.email} already emailed`);
+        } else {
+          freshRecipients.push(r);
+        }
       }
+
+      if (freshRecipients.length === 0) {
+        console.log(`   ⏭️  Skip: All contacts at ${job.company} already emailed`);
+        continue;
+      }
+
+      newJobs.push({ ...job, recipients: freshRecipients });
     }
 
     if (newJobs.length === 0) {
@@ -843,36 +899,39 @@ async function initialStartupRun() {
     } else {
       console.log(`\n🔍 STEP 2: Filtering jobs...`);
       const newJobs = [];
-      const jobsWithoutEmail = [];
 
       for (const job of jobs) {
-        // Skip if no decision maker email found
-        if (!job.decisionMakerEmail) {
-          console.log(`   📝 No decision maker email: ${job.company} - ${job.role} (will add to manual.json)`);
-          jobsWithoutEmail.push(job);
+        if (!job.recipients || job.recipients.length === 0) {
+          console.log(`   ⏭️  Skip: No contacts found for ${job.company} - ${job.role}`);
           continue;
         }
 
-        const emailSent = await isEmailSent(job.decisionMakerEmail);
-        const companySent = await isCompanySent(job.company);
-
-        if (emailSent) {
-          console.log(`   ⏭️  Skip: Email already sent to ${job.decisionMakerEmail}`);
+        if (!isWorkTypeAllowed(job)) {
+          console.log(`   ⏭️  Skip: On-site outside Kolkata - ${job.company} (${job.location})`);
           continue;
         }
-        if (companySent) {
+
+        if (await isCompanySent(job.company)) {
           console.log(`   ⏭️  Skip: Already contacted ${job.company}`);
           continue;
         }
-        newJobs.push(job);
-      }
 
-      // Add jobs without emails to manual.json
-      if (jobsWithoutEmail.length > 0) {
-        console.log(`\n📝 Adding ${jobsWithoutEmail.length} jobs to manual.json (no decision maker email found)`);
-        for (const job of jobsWithoutEmail) {
-          await addJobToManual(job);
+        // Filter out individual recipients already emailed
+        const freshRecipients = [];
+        for (const r of job.recipients) {
+          if (await isEmailSent(r.email)) {
+            console.log(`   ⏭️  Skip recipient: ${r.email} already emailed`);
+          } else {
+            freshRecipients.push(r);
+          }
         }
+
+        if (freshRecipients.length === 0) {
+          console.log(`   ⏭️  Skip: All contacts at ${job.company} already emailed`);
+          continue;
+        }
+
+        newJobs.push({ ...job, recipients: freshRecipients });
       }
 
       if (newJobs.length > 0) {
@@ -991,38 +1050,53 @@ async function main() {
 
   await verifySetup();
 
-  // Run initial startup sequence (single Gemini call)
-  console.log('🚀 Running initial startup sequence...\n');
-  await initialStartupRun();
+  const noCron = process.env.NO_CRON === 'true';
 
-  // Schedule runs at 11 AM, 2 PM, 5 PM, and 9 PM IST
-  const schedules = [
-    { cron: '0 11 * * *', label: '11:00 AM IST' },
-    { cron: '0 14 * * *', label: '2:00 PM IST' },
-    { cron: '0 17 * * *', label: '5:00 PM IST' },
-    { cron: '0 21 * * *', label: '9:00 PM IST' },
-  ];
+  if (noCron) {
+    console.log('🔁 Mode: CONTINUOUS (NO_CRON=true) — cycles run back-to-back\n');
 
-  schedules.forEach(({ cron: cronExpr, label }) => {
-    cron.schedule(cronExpr, async () => {
-      console.log(`\n⏰ Scheduled run triggered at ${label}`);
+    // Continuous loop: initial run then keep cycling
+    await initialStartupRun();
+
+    while (true) {
+      console.log('\n🔄 Starting next cycle immediately...');
       await runJobApplicationCycle();
-    }, {
-      scheduled: true,
-      timezone: 'Asia/Kolkata'
-    });
-  });
+    }
+  } else {
+    console.log('⏰ Mode: SCHEDULED (NO_CRON=false) — cron runs at fixed times\n');
 
-  console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║  ✅ INITIAL RUN COMPLETED                                  ║');
-  console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log('║  ⏰ Scheduler active! Job applications will run at:        ║');
-  schedules.forEach(({ label }) => {
-    console.log(`║     📅 ${label.padEnd(48)}║`);
-  });
-  console.log('║                                                            ║');
-  console.log('║  🔄 Service is running in the background...               ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
+    // Run initial startup sequence then hand off to cron
+    console.log('🚀 Running initial startup sequence...\n');
+    await initialStartupRun();
+
+    const schedules = [
+      { cron: '0 11 * * *', label: '11:00 AM IST' },
+      { cron: '0 14 * * *', label: '2:00 PM IST' },
+      { cron: '0 17 * * *', label: '5:00 PM IST' },
+      { cron: '0 21 * * *', label: '9:00 PM IST' },
+    ];
+
+    schedules.forEach(({ cron: cronExpr, label }) => {
+      cron.schedule(cronExpr, async () => {
+        console.log(`\n⏰ Scheduled run triggered at ${label}`);
+        await runJobApplicationCycle();
+      }, {
+        scheduled: true,
+        timezone: 'Asia/Kolkata'
+      });
+    });
+
+    console.log('\n╔════════════════════════════════════════════════════════════╗');
+    console.log('║  ✅ INITIAL RUN COMPLETED                                  ║');
+    console.log('╠════════════════════════════════════════════════════════════╣');
+    console.log('║  ⏰ Scheduler active! Job applications will run at:        ║');
+    schedules.forEach(({ label }) => {
+      console.log(`║     📅 ${label.padEnd(48)}║`);
+    });
+    console.log('║                                                            ║');
+    console.log('║  🔄 Service is running in the background...               ║');
+    console.log('╚════════════════════════════════════════════════════════════╝\n');
+  }
 }
 
 main().catch(console.error);
