@@ -16,9 +16,7 @@ const RESUME_PATH = path.join(__dirname, 'resume.pdf');
 const JOBS_DB_PATH = path.join(__dirname, 'jobs.json');
 const QUEUE_PATH = path.join(__dirname, 'jobQueue.json');
 
-// Rate limit: 12 emails per hour
-const MAX_EMAILS_PER_RUN = 12;
-const EMAIL_INTERVAL_MS = 1 * 60 * 1000; // 5 minutes between emails
+const EMAIL_INTERVAL_MS = 1 * 60 * 1000; // 1 minute between emails
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -374,11 +372,28 @@ JOB SEARCH RULES:
 - ONLY include jobs that match PROGRAMMING technologies found in the resume
 - DO NOT include jobs requiring technologies not in the resume
 
+CULTURE FIT FILTER — CRITICAL:
+The candidate is a builder and project-driven engineer, NOT a competitive programmer. Filter jobs accordingly:
+
+PREFER companies/roles that:
+- Evaluate candidates via portfolio reviews, take-home projects, GitHub profile, or system design discussions
+- Are startups or product companies that care about what you've BUILT, not how fast you solve puzzles
+- Have engineering blogs, open-source culture, or a reputation for practical/pragmatic hiring
+- Mention "real-world experience", "passion for building", "side projects", "portfolio" in their job descriptions
+- Are known for culture-fit and skills-based interviews (e.g., Vercel, Linear, Supabase, Notion, Figma, most YC startups, early-stage product companies)
+
+AVOID companies/roles that:
+- Are known for heavy LeetCode / algorithmic / DSA-heavy interview processes (e.g., Google, Meta, Amazon, Microsoft, Goldman Sachs, Tower Research, Citadel, Jane Street, competitive-programming culture shops)
+- Explicitly mention "data structures and algorithms", "competitive programming", "LeetCode", "HackerRank rounds" in job descriptions or known interview culture
+- Are in high-frequency trading, quant finance, or FAANG-tier where DSA is a strict gate
+- Have 5+ interview rounds with algorithm whiteboarding as primary filter
+
+This is a HARD filter — do not include DSA-heavy companies even if they are famous or well-funded.
+
 CRITICAL EMAIL SEARCH RULES — TWO-STEP APPROACH:
-- DO NOT find HR emails, hiring emails, or generic recruitment emails
-- Find ALL of these people at each company if possible: CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Team Lead, Senior Engineer, Staff Engineer, Principal Engineer
+- Find EVERY person you can at the company — no role is off-limits: CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Team Lead, Senior Engineer, Staff Engineer, Principal Engineer, HR, Talent Acquisition, Recruiter, Hiring Manager, anyone relevant
+- The more contacts the better — there is NO upper limit on recipients
 - Each person found = one entry in the recipients array with their OWN unique personalized email
-- Aim for 2-4 contacts per company (verified or inferred)
 
 STEP 1 — VERIFY (always try first for each person):
 - Search company websites, LinkedIn profiles, GitHub, Twitter, company blogs, press releases
@@ -415,21 +430,34 @@ SEARCH STRATEGY FOR JOBS:
 - Check company career pages, LinkedIn, Wellfound, levels.fyi
 
 SEARCH STRATEGY FOR CONTACTS (CRITICAL):
-- For each company, search for MULTIPLE contacts across all seniority levels
-- Search: "[Company name] CTO email", "[Company name] VP Engineering email", "[Company name] senior engineer LinkedIn", "[Company name] tech lead email"
-- Check: Company website team/about pages, LinkedIn profiles, GitHub profiles, Twitter/X, company blogs, press releases
-- Target roles (in priority order): CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Senior Engineer, Staff Engineer, Principal Engineer
-- Aim for 2-4 contacts per company (mix of verified + inferred is fine)
+- For each company, search exhaustively for as many contacts as possible — no cap
+- Search: "[Company name] CTO email", "[Company name] HR email", "[Company name] recruiter email", "[Company name] hiring manager", "[Company name] VP Engineering email", "[Company name] senior engineer LinkedIn", "[Company name] tech lead email", "[Company name] talent acquisition"
+- Check: Company website team/about/contact pages, LinkedIn profiles, GitHub profiles, Twitter/X, company blogs, press releases, job postings (often list recruiter names)
+- Target everyone: CEO, CTO, Co-Founder, VP Engineering, Head of Engineering, Engineering Manager, Tech Lead, Senior Engineer, Staff Engineer, Principal Engineer, HR, Recruiter, Talent Acquisition, Hiring Manager
+- No limit on how many recipients — find and include every person you can verify or infer
 - For each person: try verified email first (emailGuessed: false), then infer from domain pattern (emailGuessed: true)
 - To find the domain: look for any employee email visible anywhere, or check the company website's contact/about page
 - If you find 0 verified AND cannot determine the domain → set recipients to [] but STILL INCLUDE THE JOB
 - Jobs with empty recipients array will be automatically skipped
 
-EMAIL SUBJECT RULES (make it impossible NOT to open):
-- The subject must be a shocking, provocative, witty punchline — NOT a boring "Application for X" line
-- It should feel like breaking news, a confession, a dare, or something deeply personal to the recipient
-- Tailor the subject to the recipient's title and company — make it feel like it was written ONLY for them
-- Examples of the tone you MUST match (do not copy these exactly, generate fresh ones each time):
+EMAIL SUBJECT RULES — TWO MODES based on recipient title:
+
+MODE A — HR / Recruiter / Talent Acquisition / Hiring Manager:
+- Use a clean, professional, compelling subject line
+- Should be specific to the role and show genuine interest
+- Examples:
+  * "Interested in [Role] at [Company] — [Candidate Name]"
+  * "[X] years of [Tech Stack] — Excited about [Company]'s mission"
+  * "Strong [Role] candidate — would love to connect"
+  * "[Candidate Name] | [Role] | [Key Skill] specialist"
+- Tone: warm, direct, professional
+- Max 12 words
+
+MODE B — Everyone else (CEO, CTO, Co-Founder, VP, Engineering Manager, Tech Lead, Senior/Staff/Principal Engineer, etc.):
+- The subject must be a shocking, provocative, witty punchline — impossible NOT to open
+- It should feel like breaking news, a confession, a dare, or something personal to the recipient and their company
+- Tailor it to their specific title and company — it must feel written ONLY for them
+- Examples of the tone (do not copy exactly, generate fresh ones every time):
   * "I broke prod at 3 companies. Want me to break yours next?"
   * "Your engineers are leaving. I know why."
   * "I reverse-engineered your stack. We need to talk."
@@ -442,24 +470,41 @@ EMAIL SUBJECT RULES (make it impossible NOT to open):
 - Never use: "Application for", "Job opportunity", "Referral request", "Reaching out about"
 - Max 10 words. Punchy. Ruthless. Unmissable.
 
+IMPORTANT: Check the recipient's title carefully before choosing MODE A or MODE B.
+
 EMAIL BODY RULES (generate SEPARATELY and UNIQUELY for EACH recipient):
 - Each recipient gets a FULLY UNIQUE email — never duplicate subject or body across recipients at the same company
-- FIRST LINE: Acknowledge the wild subject with a brief, charming apology that makes them smile
-  Example openers: "I know — that subject line was a lot. Forgive me. But you opened it, so we're already off to a great start."
-  Or: "Yes, I know. The subject was dramatic. I owe you an apology and also a really good pitch — here's both."
-  Or: "Okay, I'm sorry about the subject. Sort of. You opened it though, so let's make this worth your time."
-- After the apology, pivot cleanly into the actual pitch — make it feel natural, not forced
-- Address each person by name and tailor the angle to their specific title:
+- The tone should be: confident, self-aware, slightly audacious — someone they WANT to work with
+- DO NOT make up achievements - only use what's in the resume
+- Tailor the angle to the recipient's title:
   * CEO/Founder: business impact, growth, execution mindset
   * CTO/VP Engineering: technical depth, architecture, engineering culture
   * Engineering Manager/Tech Lead: team collaboration, shipping velocity, mentorship
   * Senior/Staff/Principal Engineer: specific technologies, code quality, technical details
-- Highlight 2-3 KEY achievements from the resume that resonate with THIS specific person's perspective
-- MUST include a STRONG CALL TO ACTION asking for a referral
-- Max 160 words total (including apology opener)
-- Sign off with the candidate's actual name from the resume
-- DO NOT make up achievements - only use what's in the resume
-- The tone should be: confident, self-aware, slightly audacious — someone they WANT to work with
+  * HR/Recruiter/Talent: enthusiasm, culture fit, eagerness to contribute
+
+STRICT FORMAT — the emailBody field MUST follow this EXACT structure with blank lines between each section:
+
+Hi [First Name],
+
+[Opening line — depends on MODE:
+  • MODE A (HR/Recruiter): Skip the apology. Open directly and professionally. E.g. "I came across the [Role] opening at [Company] and genuinely excited about what your team is building."
+  • MODE B (everyone else): Apology for the wild subject — 1 sentence, charming. E.g. "I know — that subject line was a lot. Forgive me, but you opened it, so here we are." / "Yes, dramatic subject. I owe you an apology and a solid pitch — here's both."]
+
+[Pitch paragraph — 2-3 sentences. Who the candidate is, what role they want, why THIS company specifically. Tailored to the recipient's role.]
+
+[Achievements — 2-3 bullet points, each starting with "•", one line each, quantified where possible from the resume]
+
+[CTA — 1 strong sentence asking for referral or a quick chat. E.g. "Would you be open to referring me, or pointing me to the right person on your team?"]
+
+Best regards,
+[Candidate Full Name]
+
+FORMATTING RULES:
+- Use blank lines (\\n\\n) between each section above — never run sections together
+- Each bullet point on its own line starting with "•"
+- No walls of text — every section is separated and scannable
+- Max 160 words total
 
 IMPORTANT:
 - bestFit must be one of: "indian_mid_startup", "foreign_startup", "mnc", "early_startup"
@@ -619,7 +664,14 @@ async function sendEmail(recipients, subject, body, senderName) {
       to: toList.join(', '),
       subject,
       text: body,
-      html: `<pre style="font-family: Arial, sans-serif; white-space: pre-wrap;">${body}</pre>`,
+      html: `<div style="font-family: Arial, sans-serif; font-size: 15px; line-height: 1.6; color: #222; max-width: 600px;">${
+        body
+          .split('\n\n')
+          .map(para => para.trim())
+          .filter(Boolean)
+          .map(para => `<p style="margin: 0 0 14px 0;">${para.replace(/\n/g, '<br/>')}</p>`)
+          .join('')
+      }</div>`,
       attachments: [
         {
           filename: 'resume.pdf',
@@ -645,7 +697,7 @@ function getLastRunTime() {
   return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 }
 
-async function processJobQueue(senderName, clearAll = false) {
+async function processJobQueue(senderName) {
   const queueSize = await getQueueSize();
 
   if (queueSize === 0) {
@@ -656,23 +708,18 @@ async function processJobQueue(senderName, clearAll = false) {
   console.log(`\n📬 Found ${queueSize} companies in queue. Processing...`);
 
   const queue = await loadQueue();
-  const jobsToProcess = clearAll ? queue : queue.slice(0, MAX_EMAILS_PER_RUN);
+  const jobsToProcess = queue;
 
   const totalEmails = jobsToProcess.reduce((sum, j) => sum + (j.recipients?.length || 0), 0);
   const totalDelayMs = Math.max(0, totalEmails - 1) * EMAIL_INTERVAL_MS;
   const estimatedMinutes = Math.round(totalDelayMs / 60000);
 
-  if (clearAll) {
-    console.log(`🔥 Processing ALL ${jobsToProcess.length} companies (${totalEmails} emails total)...`);
-  } else {
-    console.log(`📧 Processing ${jobsToProcess.length} companies (${totalEmails} emails, max ${MAX_EMAILS_PER_RUN}/run)...`);
-  }
+  console.log(`🔥 Processing ALL ${jobsToProcess.length} companies (${totalEmails} emails total)...`);
   console.log(`⏱️  Estimated time: ~${estimatedMinutes} minutes`);
   console.log('─'.repeat(60));
 
   let sentCount = 0;
   let failedCount = 0;
-  let emailsSentThisRun = 0;
 
   for (let i = 0; i < jobsToProcess.length; i++) {
     const job = jobsToProcess[i];
@@ -709,7 +756,6 @@ async function processJobQueue(senderName, clearAll = false) {
 
         await sendEmail([recipient.email], subject, body, senderName);
         sentRecipients.push(recipient);
-        emailsSentThisRun++;
         sentCount++;
         console.log(`      ✅ Sent!`);
 
@@ -739,11 +785,6 @@ async function processJobQueue(senderName, clearAll = false) {
       await delay(EMAIL_INTERVAL_MS);
     }
 
-    // Rate limit check (only when not clearAll)
-    if (!clearAll && emailsSentThisRun >= MAX_EMAILS_PER_RUN) {
-      console.log(`\n⚠️ Rate limit reached (${emailsSentThisRun} emails). Stopping for this run.`);
-      break;
-    }
   }
 
   console.log('\n' + '─'.repeat(60));
@@ -756,8 +797,7 @@ async function runJobApplicationCycle() {
   console.log('\n' + '🚀'.repeat(20));
   console.log('🚀 STARTING JOB APPLICATION CYCLE');
   console.log('🚀'.repeat(20));
-  console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
-  console.log(`📧 Rate limit: ${MAX_EMAILS_PER_RUN} emails/hour\n`);
+  console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n`);
 
   try {
     // Single Gemini call for everything
@@ -775,13 +815,7 @@ async function runJobApplicationCycle() {
     const queueSize = await getQueueSize();
     if (queueSize > 0) {
       console.log(`\n🔄 Processing existing queue (${queueSize} jobs pending)...`);
-      const processedCount = await processJobQueue(senderName, false);
-
-      if (processedCount >= MAX_EMAILS_PER_RUN) {
-        console.log(`\n✅ Processed ${processedCount} jobs from queue. Max limit reached.`);
-        console.log(`📝 Will process new jobs in next cycle.\n`);
-        return;
-      }
+      await processJobQueue(senderName);
     }
 
     if (jobs.length === 0) {
@@ -834,7 +868,7 @@ async function runJobApplicationCycle() {
     await addJobsToQueue(newJobs);
 
     console.log(`\n📨 Processing newly added jobs...`);
-    await processJobQueue(senderName, false);
+    await processJobQueue(senderName);
 
     const stats = await getJobStats();
     const remainingInQueue = await getQueueSize();
@@ -867,7 +901,7 @@ async function initialStartupRun() {
     const initialQueueSize = await getQueueSize();
     if (initialQueueSize > 0) {
       console.log(`\n📋 Processing existing queue (${initialQueueSize} jobs)...`);
-      await processJobQueue(senderName, true);
+      await processJobQueue(senderName);
 
       const remainingAfterClear = await getQueueSize();
       if (remainingAfterClear > 0) {
@@ -938,7 +972,7 @@ async function initialStartupRun() {
         await addJobsToQueue(newJobs);
 
         console.log(`\n📨 STEP 3: Processing all newly added jobs...`);
-        await processJobQueue(senderName, true);
+        await processJobQueue(senderName);
 
         const finalQueueSize = await getQueueSize();
         if (finalQueueSize > 0) {
