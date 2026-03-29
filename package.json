@@ -22,6 +22,6 @@
     "axiodb": "^4.33.127",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.15"
+    "nodemailer": "^7.0.11"
   }
 }
